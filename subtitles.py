@@ -1038,9 +1038,10 @@ def split_cues(text):
 
 
 LINGER_S = 1.0                                      # a subtitle stays at most this long after its words end
+LATE_S = 0.2                                  # most a subtitle may start after its voice (see polish)
 
 
-def make_cues(lines):
+def make_cues(lines, onsets=None):
     """Lines (start, end, english) -> finished subtitles (start, end, 'line1\nline2') following subtitle rules:
     songs dropped and overlaps tidied (tidy_lines), clean text, at most 2 balanced lines of 42, long lines split
     at clause breaks with time shared by length, at least 1 s / ~17 characters per second on screen (stretching
@@ -1056,10 +1057,17 @@ def make_cues(lines):
         if not parts:
             continue
         tot = sum(len(p) for p in parts) or 1
-        t = st
-        for p in parts:
-            d = (et - st) * len(p) / tot
-            cues.append([t, t + d, p, song, t + d]); t += d          # [4]: where the words end
+        cut, t = [st], st                                    # where each part starts: by its share of the characters,
+        for p in parts[:-1]:                                 # then moved to the speaker's pause nearby (onsets: times
+            t += (et - st) * len(p) / tot                    # the voice resumes, same clock as the lines)
+            if onsets is not None and len(onsets) and not song:
+                c = onsets[(onsets >= max(t - 0.8, cut[-1] + 0.8)) & (onsets <= min(t + 0.8, et - 0.6))]
+                if len(c):
+                    t = float(c[np.argmin(np.abs(c - t))])
+            cut.append(t)
+        cut.append(et)
+        for k, p in enumerate(parts):                        # [4]: where the words end; [5]: starts on the voice
+            cues.append([cut[k], cut[k + 1], p, song, cut[k + 1], k == 0])
     cues.sort(key=lambda c: c[0])
     for i, c in enumerate(cues):
         nxt = cues[i + 1][0] if i + 1 < len(cues) else c[0] + 7.0
@@ -1081,12 +1089,16 @@ def polish(cues):
         if out and c[2].lower() == out[-1][2].lower() and c[0] - out[-1][1] < 1.5:
             out[-1][1] = min(max(out[-1][1], c[1]), out[-1][0] + 7.0); continue
         out.append(list(c))
+    # A subtitle that begins a line was snapped to where the voice starts: it may start at most LATE_S later to make
+    # room for the one before (a reader notices more than that; 2026-10-16 schedule read 0.6-1 s late). The middle
+    # parts of a long line were placed by length, so they may move further.
+    late = lambda c: LATE_S if len(c) > 5 and c[5] else 1.0
     for i in range(len(out) - 1):
         a, b = out[i], out[i + 1]
         if a[1] - a[0] < 0.83 and b[1] - b[0] > 1.6:
             need = min(0.83 - (a[1] - a[0]), (b[1] - b[0]) - 1.2)
             if b[0] - a[1] < need + 0.08:
-                b[0] = a[1] + need + 0.08 if b[0] < a[1] + need + 0.08 else b[0]
+                b[0] = min(a[1] + need + 0.08, b[0] + late(b)) if b[0] < a[1] + need + 0.08 else b[0]
             a[1] = min(a[1] + need, b[0] - 0.08)
     # too much to read (over 20 characters a second): a small lead-in from free time before (at most 0.3 s, as on
     # broadcast TV), then time the next subtitle can spare (it starts a little later but keeps enough for its own text)
@@ -1100,13 +1112,27 @@ def polish(cues):
         if need > 0 and i + 1 < len(out):
             n = out[i + 1]
             spare = (n[1] - n[0]) - max(0.83, len(n[2]) / 17.0)
-            take = max(0.0, min(need, spare, 1.0))
+            take = max(0.0, min(need, spare, late(n)))
             if take > 0:
                 n[0] += take
                 c[1] = min(c[1] + take, n[0] - 0.08)
+    # still under the broadcast minimum (quick dialogue, the next line pinned to its voice): appear a little early,
+    # into free time (at most 0.4 s), then take what the subtitle before can spare
+    for i, c in enumerate(out):
+        if i + 1 < len(out) and out[i + 1][0] - c[1] < 0.08 and out[i + 1][0] - c[0] < 0.91:
+            c[1] = out[i + 1][0] - 0.08                     # it runs into the next one: measured as it will be shown
+        need = 0.83 - (c[1] - c[0])
+        if need <= 0:
+            continue
+        lead = max(0.0, min(need, 0.4, c[0] - (out[i - 1][1] + 0.08 if i else 0)))
+        c[0] -= lead; need -= lead
+        if need > 0 and i:
+            p = out[i - 1]
+            take = max(0.0, min(need, (p[1] - p[0]) - max(0.83, len(p[2]) / 17.0)))
+            p[1] -= take; c[0] -= take
     for i in range(1, len(out)):
         a, b = out[i - 1], out[i]
-        if b[0] < a[1] + 0.08 and a[1] - a[0] <= 0.9 and b[1] - (a[1] + 0.08) >= 1.2:
+        if b[0] < a[1] + 0.08 and a[1] - a[0] <= 0.9 and b[1] - (a[1] + 0.08) >= 1.2 and a[1] + 0.08 - b[0] <= late(b):
             b[0] = a[1] + 0.08                      # a short line keeps its time; the long next one starts a moment later
         if out[i][0] < out[i - 1][1] + 0.08:
             out[i - 1][1] = max(out[i - 1][0] + 0.5, out[i][0] - 0.08)
@@ -1150,6 +1176,82 @@ def voiced_seconds(x, st, et):
     return n * hop / 16000
 
 
+def speech_onsets(x):
+    """Times (s) where speech starts in x (16 kHz): phrase-level activity well above the noise floor."""
+    hop = 320
+    n = len(x) // hop
+    if n < 10:
+        return np.array([])
+    fr = x[:n * hop].reshape(n, hop).astype(np.float32)
+    db = 20 * np.log10(np.sqrt((fr ** 2).mean(axis=1)) + 1e-9)
+    act = db > np.percentile(db, 20) + 10
+    act = np.convolve(act.astype(np.int32), np.ones(10, dtype=np.int32), 'same') > 5
+    return (np.where(~act[:-1] & act[1:])[0] + 1) * 0.02
+
+
+def pause_ends(x, depth=9.0):
+    """Where the voice resumes after a short pause inside continuous speech (between clauses, where the global
+    threshold of speech_onsets sees no gap): a dip at least `depth` dB below the speech on both sides within 0.3 s,
+    lasting 60 ms or more; the time is where the level climbs back. Times in s into x (16 kHz)."""
+    hop = 320
+    n = len(x) // hop
+    if n < 30:
+        return np.array([])
+    fr = x[:n * hop].reshape(n, hop).astype(np.float32)
+    db = 20 * np.log10(np.sqrt((fr ** 2).mean(axis=1)) + 1e-9)
+    s = np.convolve(db, np.ones(3) / 3, 'same')
+    floor = np.percentile(db, 20)
+    out, i = [], 15
+    while i < n - 15:
+        if s[i] == s[i - 5:i + 6].min():
+            d = min(s[i - 15:i].max(), s[i:i + 15].max()) - s[i]
+            if d >= depth and s[i:i + 15].max() > floor + 10:
+                low = s[i] + d / 2
+                if (s[i - 5:i + 6] < low).sum() >= 3:
+                    j = i
+                    while j < n - 1 and s[j] < low:
+                        j += 1
+                    out.append(j * 0.02)
+                    i = j + 5
+                    continue
+        i += 1
+    return np.array(out)
+
+
+def voice_starts(x):
+    """Every place the voice starts or resumes in x: after silence (speech_onsets) or after a short pause (pause_ends).
+    make_cues puts the break between two parts of a long line on one of these."""
+    return np.unique(np.round(np.concatenate([speech_onsets(x), pause_ends(x)]), 2))
+
+
+def align_score(lines, x):
+    """How well a chunk's spoken lines sit on the speech: the share whose start is within 0.3 s of a speech onset,
+    and how many spoken lines there are (songs are not counted: singing over music has no clean onsets)."""
+    spoken = [l for l in lines if not l[2].startswith('♪')]
+    on = speech_onsets(x)
+    if not spoken or not len(on):
+        return 1.0, len(spoken)
+    return sum(1 for st, et, en in spoken if float(np.min(np.abs(on - st))) <= 0.3) / len(spoken), len(spoken)
+
+
+def well_aligned(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
+    """Snap a chunk's lines to the voice; if fewer than 60% of its spoken lines then start on speech (Gemini timed the
+    chunk badly), ask Gemini again (up to `tries` times, while time allows) and keep the best-aligned answer."""
+    best = snap_to_speech(lines, x)
+    score, n = align_score(best, x)
+    for attempt in range(tries):
+        if score >= 0.6 or n < 3 or time.time() > deadline - 20:
+            break
+        new = gemini.subtitles(flac, seconds, deadline, expect)
+        if not new:
+            continue
+        cand = snap_to_speech(new, x)
+        cs, cn = align_score(cand, x)
+        if cs > score and cn >= 0.7 * n:                  # better timed, and not by dropping lines
+            best, score, n = cand, cs, cn
+    return best
+
+
 def snap_to_speech(lines, x):
     """Gemini's times are rough (~0.5 s). Move each line's start to where speech actually starts nearby (and its end to
     where it stops), from the sound itself: phrase-level activity = frames well above the noise floor, smoothed over
@@ -1169,10 +1271,31 @@ def snap_to_speech(lines, x):
     act = np.convolve(act.astype(np.int32), np.ones(10, dtype=np.int32), 'same') > 5
     on = (np.where(~act[:-1] & act[1:])[0] + 1) * 0.02
     off = (np.where(act[:-1] & ~act[1:])[0] + 1) * 0.02
+    # Gemini sometimes misplaces a whole chunk by 1-2 s (2026-10-16 12:29-12:31: every line late). Find the one
+    # shift (up to +-2.5 s) that puts the most line starts on speech onsets; use it only when clearly better and
+    # at least 3 lines agree. Songs are left alone: singing over music has no clean onsets.
+    spoken = [l for l in lines if not l[2].startswith('♪')]
+    if len(spoken) >= 3 and len(on):
+        def score(d):
+            return sum(max(0.0, 1 - float(np.min(np.abs(on - (st + d)))) / 0.4) for st, et, en in spoken)
+        shifts = np.arange(-2.5, 2.51, 0.1)
+        sc = [score(d) for d in shifts]
+        k = int(np.argmax(sc))
+        d, base = float(shifts[k]), score(0.0)
+        if abs(d) >= 0.4 and sc[k] >= base + 1.0 and sc[k] >= 1.3 * max(base, 0.5):
+            lines = [(st + d, et + d, en) if not en.startswith('♪') else (st, et, en) for st, et, en in lines]
     out = []
     for st, et, en in lines:
         c = on[(on >= st - 1.0) & (on <= st + 0.6)]
         st2 = float(c[np.argmin(np.abs(c - st))]) if len(c) else st
+        # a line Gemini starts on silence: the words come with the first onset after it (2026-10-16: 7% of
+        # sentence starts sat 0.6-1 s ahead of the voice, beyond the reach above). Silence here also means a music
+        # bed with no voice on it: clearly (8 dB+) quieter than the first 0.4 s after the onset.
+        c = on[(on > st) & (on <= min(st + 1.5, et - 0.5))] if not en.startswith('♪') else []
+        if len(c):
+            i0, i1 = max(0, int(st / 0.02)), int(c[0] / 0.02)
+            if voiced_seconds(x, st, st + 0.3) < 0.1 or (i1 - i0 >= 3 and db[i1:i1 + 20].mean() - db[i0:i1].mean() >= 8):
+                st2 = float(c[0])
         c = off[(off >= et - 0.6) & (off <= et + 1.0) & (off > st2 + 0.6)]
         et2 = float(c[np.argmin(np.abs(c - et))]) if len(c) else et
         out.append((st2, max(et2, st2 + 0.8), en))
@@ -1361,7 +1484,9 @@ class Channel(threading.Thread):
                 lines = self.gemini.subtitles(flac, secs, deadline, expect) if self.gemini else None
                 if lines == [] and expect and self.gemini and time.time() < deadline - 40:
                     lines = recheck_empty(self.gemini.key, audio, secs, self.gemini) or []   # music, or skipped speech
-                cues = make_cues(snap_to_speech(lines, audio)) if lines else []
+                if lines and self.gemini:
+                    lines = well_aligned(self.gemini, flac, audio, secs, deadline, expect, lines)   # badly timed: ask again
+                cues = make_cues(snap_to_speech(lines, audio), voice_starts(audio)) if lines else []
                 if cues and self.gemini and time.time() < deadline - 20:
                     cues = condense_cues(self.gemini.key, cues)                         # too dense to read: shorten
                 return (None if lines is None else cues), time.time() - t0

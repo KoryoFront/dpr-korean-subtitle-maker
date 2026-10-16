@@ -609,10 +609,18 @@ def main():
                 done[0] += 1
                 if done[0] % 25 == 0 or done[0] == len(chunks):
                     say('  %d/%d chunks done' % (done[0], len(chunks)))
-            out = (LIVE.snap_to_speech if LIVE else snap_to_speech)([tuple(x) for x in out], xc)    # live: + no lines over silence
+            if LIVE and out:
+                # snapped to the voice; a chunk Gemini timed badly is asked again and the best-aligned answer kept
+                g = _live_gemini.setdefault(key, LIVE.Gemini(key))
+                out = LIVE.well_aligned(g, to_flac(xc), xc, float(c1 - c0), time.time() + 300, True, [tuple(x) for x in out])
+            else:
+                out = snap_to_speech([tuple(x) for x in out], xc)
+            if LIVE:
+                with lock:
+                    starts.append(c0 + LIVE.voice_starts(xc))   # where the voice resumes: long lines break there
             return [(c0 + st, c0 + et, en) for st, et, en in out]
 
-        jobs = list(enumerate(chunks))
+        jobs, starts = list(enumerate(chunks)), []
         with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
             results = list(pool.map(one, jobs))
         missing = [j for j, r in zip(jobs, results) if r is None]
@@ -622,7 +630,8 @@ def main():
             if r: lines += r
             else: say('  chunk %d has no subtitles (Gemini kept failing)' % j[0])
         if LIVE:                                              # exactly the live engine's rules, then broadcast shortening
-            cues = LIVE.make_cues([(s + a_off, e + a_off, LIVE.dprk_english(t)) for s, e, t in lines])
+            cues = LIVE.make_cues([(s + a_off, e + a_off, LIVE.dprk_english(t)) for s, e, t in lines],
+                                  np.sort(np.concatenate(starts)) + a_off if starts else None)
             say('shortening subtitles too dense to read ...')
             cues = LIVE.condense_cues(key, cues)
             bold = LIVE.bold_leaders
