@@ -330,7 +330,7 @@ GEMINI_PROMPT = (
     "for subtitles. "
     "Include EVERY spoken sentence: never skip, shorten away or summarise speech, and include words cut off at the very "
     "start or end of the clip. "
-    "SUBTITLE STYLE for the English: concise and natural, sentence case, numbers one to ten in words and 11 upwards in "
+    "SUBTITLE STYLE for the English: concise and natural, sentence case, clock times always as 24-hour digits like the DPRK's own schedule cards (18시 49분 = 18:49, 오후 3시 8분 = 15:08, never '49 minutes past 6'), numbers one to ten in words and 11 upwards in "
     "digits (but times, dates, ages, percentages and anything with a unit always in digits: 3 km, 9 o'clock, 5%), normal punctuation as in broadcast subtitles (a full stop at the end of every sentence; a stretch that ends "
     "mid-sentence has no end punctuation or just its natural comma), no filler or hesitation words (예, 애, 음, 네 as filler -> leave out), no speaker labels; each stretch must "
     "fit in a subtitle of at most 74 characters, so split long sentences into separate stretches at natural clause "
@@ -542,6 +542,90 @@ class Gemini:
                 self.errors.append(time.time())
                 time.sleep(1)
         return None
+
+
+# ---------------------------------------------------------------- recordings: the extra passes used for whole days
+def gemini_json(key, parts, schema=None, timeout=120, tries=8):
+    """One Gemini request returning JSON (retries while Google is busy). None if it never answered."""
+    cfg = {"temperature": 0, "responseMimeType": "application/json"}
+    if schema:
+        cfg["responseSchema"] = schema
+    body = json.dumps({"contents": [{"parts": parts}], "generationConfig": cfg}).encode()
+    url = 'https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % GEMINI_MODEL
+    for attempt in range(tries):
+        try:
+            r = json.load(urllib.request.urlopen(urllib.request.Request(url, data=body, headers={'x-goog-api-key': key, 'Content-Type': 'application/json'}), timeout=timeout))
+            return json.loads(r['candidates'][0]['content']['parts'][0]['text'])
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 401, 402, 403):
+                return None
+            time.sleep(3 + 2 * attempt)
+        except Exception:
+            time.sleep(3)
+    return None
+
+
+def speech_or_music(key, flac):
+    """(speech, singing) for a stretch of audio: a chunk that came back empty but is full of sound is usually music,
+    sometimes speech Gemini skipped (2026-10-16: 144 music, 25 speech among such chunks)."""
+    v = gemini_json(key, [{"inline_data": {"mime_type": "audio/flac", "data": base64.b64encode(flac).decode()}},
+                          {"text": "Is anyone speaking in this audio? Is anyone singing words?"}],
+                    {"type": "OBJECT", "properties": {"speech": {"type": "BOOLEAN"}, "singing": {"type": "BOOLEAN"}},
+                     "required": ["speech", "singing"]})
+    return (bool(v and v.get('speech')), bool(v and v.get('singing')))
+
+
+def recheck_empty(key, x, seconds, gemini=None):
+    """An empty answer for audio full of voice-band sound: ask whether anyone speaks or sings and, if so, transcribe
+    again (up to 3 times). Returns new lines (snapped to the voice) or [] for music."""
+    if voiced_seconds(x, 0, seconds) <= 0.6 * seconds:
+        return []
+    flac = to_flac(x)
+    if not any(speech_or_music(key, flac)):
+        return []
+    g = gemini or Gemini(key)
+    for attempt in range(3):
+        out = g.subtitles(flac, float(seconds), time.time() + 200, True)
+        if out:
+            return snap_to_speech(out, x)
+    return []
+
+
+def condense_cues(key, cues, cps=20.0):
+    """Broadcast practice for subtitles too dense to read: shorten the text to fit its time (at most `cps` characters
+    a second), keeping the meaning, every name and every number. Text-only requests in groups of 40; a shortened
+    line that loses a name or number, or is still too long, is refused. cues: [(start, end, text)] as make_cues gives."""
+    cues = list(cues)
+    todo = []
+    for i, (st, et, t) in enumerate(cues):
+        plain = t.replace('\n', ' ')
+        if len(plain) / max(0.1, et - st) > cps:
+            todo.append((i, plain.startswith('♪'), plain.strip('♪ ').strip(), max(12, int(cps * (et - st)))))
+    def ok(old, new, mx):
+        if not new or len(new) > mx + 3:
+            return False
+        return all(n in new for n in re.findall(r'\d+', old)) and all(n in new for n in re.findall(r'\b[A-Z][a-z]+\b', old)[1:])
+    schema = {"type": "OBJECT", "properties": {"lines": {"type": "ARRAY", "items": {"type": "STRING"}}}, "required": ["lines"]}
+    done = 0
+    for k in range(0, len(todo), 40):
+        grp = todo[k:k + 40]
+        prompt = ("Shorten each English TV subtitle to at most the given number of characters, as a professional broadcast "
+                  "subtitler would: keep the meaning, every name and every number; drop repetition and padding; normal "
+                  "punctuation with a full stop at the end of a sentence (keep a missing end mark missing: that line "
+                  "continues). Return {\"lines\": [...]} in the same order.\n" +
+                  json.dumps([{'max': mx, 'text': txt} for i, song, txt, mx in grp], ensure_ascii=False))
+        v = gemini_json(key, [{"text": prompt}], schema)
+        out = (v or {}).get('lines') or []
+        if len(out) != len(grp):
+            continue
+        for (i, song, txt, mx), new in zip(grp, out):
+            new = dprk_english(str(new).strip())
+            if ok(txt, new, mx):
+                rows = split_two(new) or [new]
+                cues[i] = (cues[i][0], cues[i][1], song_marks(rows) if song else '\n'.join(rows))
+                done += 1
+    log('shortened %d of %d dense subtitles' % (done, len(todo)))
+    return cues
 
 
 # ---------------------------------------------------------------- audio helpers
@@ -1272,9 +1356,15 @@ class Channel(threading.Thread):
             flac = to_flac(audio)
             expect = voiced_seconds(audio, 0, secs) > 0.35 * secs
             def ask():
+                # the same passes as a recorded day (dayjob / make_subtitles), each only while there is time left
                 t0 = time.time()
                 lines = self.gemini.subtitles(flac, secs, deadline, expect) if self.gemini else None
-                return lines, time.time() - t0
+                if lines == [] and expect and self.gemini and time.time() < deadline - 40:
+                    lines = recheck_empty(self.gemini.key, audio, secs, self.gemini) or []   # music, or skipped speech
+                cues = make_cues(snap_to_speech(lines, audio)) if lines else []
+                if cues and self.gemini and time.time() < deadline - 20:
+                    cues = condense_cues(self.gemini.key, cues)                         # too dense to read: shorten
+                return (None if lines is None else cues), time.time() - t0
             entry.update(segs=segs, audio=audio, offsets=offsets, future=self.pool.submit(ask))
         self.inflight.append(entry)
 
@@ -1298,7 +1388,7 @@ class Channel(threading.Thread):
         self.stats.append((time.time(), lines is not None, len(lines or []), took))
         segs, audio, offsets = e['segs'], e['audio'], e['offsets']
         cues = {q: [] for q in seqs}
-        for st, et, text in make_cues(snap_to_speech(lines or [], audio)):
+        for st, et, text in (lines or []):                         # finished subtitles from the worker (ask)
             self.last_line, self.last_line_at = text.replace('\n', ' '), time.time()
             self.place_cue(segs, offsets, cues, st, et, text)
         if carried is not None:

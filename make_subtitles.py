@@ -597,11 +597,19 @@ def main():
                 with open(f + '.tmp', 'w', encoding='utf-8') as fh:
                     json.dump(out, fh, ensure_ascii=False)
                 os.replace(f + '.tmp', f)
+            xc = a[c0 * SR:c1 * SR].astype(np.float32) / 32768
+            if LIVE and not out:
+                # empty but full of sound: music, or speech Gemini skipped -> transcribed again (as live and as dayjob)
+                out = LIVE.recheck_empty(key, xc, float(c1 - c0), _live_gemini.get(key)) or []
+                if out:
+                    with open(f + '.tmp', 'w', encoding='utf-8') as fh:
+                        json.dump(out, fh, ensure_ascii=False)
+                    os.replace(f + '.tmp', f)
             with lock:
                 done[0] += 1
                 if done[0] % 25 == 0 or done[0] == len(chunks):
                     say('  %d/%d chunks done' % (done[0], len(chunks)))
-            out = snap_to_speech([tuple(x) for x in out], a[c0 * SR:c1 * SR].astype(np.float32) / 32768)
+            out = (LIVE.snap_to_speech if LIVE else snap_to_speech)([tuple(x) for x in out], xc)    # live: + no lines over silence
             return [(c0 + st, c0 + et, en) for st, et, en in out]
 
         jobs = list(enumerate(chunks))
@@ -613,10 +621,17 @@ def main():
             r = one(j)
             if r: lines += r
             else: say('  chunk %d has no subtitles (Gemini kept failing)' % j[0])
-        cues = (LIVE.make_cues if LIVE else make_cues)([(s + a_off, e + a_off, dprk_english(t)) for s, e, t in lines])
+        if LIVE:                                              # exactly the live engine's rules, then broadcast shortening
+            cues = LIVE.make_cues([(s + a_off, e + a_off, LIVE.dprk_english(t)) for s, e, t in lines])
+            say('shortening subtitles too dense to read ...')
+            cues = LIVE.condense_cues(key, cues)
+            bold = LIVE.bold_leaders
+        else:
+            cues = make_cues([(s + a_off, e + a_off, dprk_english(t)) for s, e, t in lines])
+            bold = bold_leaders
         with open(srt + '.part', 'w', encoding='utf-8') as fh:
             for i, (st, et, t) in enumerate(cues, 1):
-                fh.write('%d\n%s --> %s\n%s\n\n' % (i, srt_time(st), srt_time(et), bold_leaders(t)))
+                fh.write('%d\n%s --> %s\n%s\n\n' % (i, srt_time(st), srt_time(et), bold(t)))
         os.replace(srt + '.part', srt)
         del a
         say('%d subtitles written to %s' % (len(cues), srt))
