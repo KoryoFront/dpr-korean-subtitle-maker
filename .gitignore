@@ -1,0 +1,6 @@
+state/
+tools/sources/
+__pycache__/
+*_English.mkv
+*_English.srt
+data/search.db
