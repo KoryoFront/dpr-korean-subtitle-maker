@@ -639,7 +639,8 @@ def main():
                 out = snap_to_speech([tuple(x) for x in out], xc)
             if LIVE and out:                                  # the timing (subtitles.timed_lines)
                 g = _live_gemini.setdefault(key, LIVE.Gemini(key))
-                out = LIVE.snap_to_speech([tuple(l[:3]) for l in out], xc, None, g.korean)
+                out = LIVE.song_check(key, xc, [tuple(l[:3]) for l in out])   # 'songs' that are speech or not there
+                out = LIVE.snap_to_speech(out, xc, None, g.korean)
             if LIVE:
                 with lock:
                     starts.append(c0 + LIVE.voice_starts(xc))   # where the voice resumes: long lines break there

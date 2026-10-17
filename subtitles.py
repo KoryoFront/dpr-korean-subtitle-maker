@@ -581,7 +581,7 @@ class Gemini:
 
 
 # ---------------------------------------------------------------- recordings: the extra passes used for whole days
-def gemini_json(key, parts, schema=None, timeout=120, tries=8):
+def gemini_json(key, parts, schema=None, timeout=120, tries=8, model=None):
     """One Gemini request returning JSON (retries while Google is busy). None if it never answered."""
     cfg = {"temperature": 0, "responseMimeType": "application/json"}
     if schema:
@@ -589,7 +589,7 @@ def gemini_json(key, parts, schema=None, timeout=120, tries=8):
     body = json.dumps({"contents": [{"parts": parts}], "generationConfig": cfg}).encode()
     for attempt in range(tries):
         try:
-            r = json.load(urllib.request.urlopen(gemini_request(key, GEMINI_MODEL, body), timeout=timeout))
+            r = json.load(urllib.request.urlopen(gemini_request(key, model or GEMINI_MODEL, body), timeout=timeout))
             return json.loads(r['candidates'][0]['content']['parts'][0]['text'])
         except urllib.error.HTTPError as e:
             if e.code in (400, 401, 402, 403):
@@ -598,6 +598,46 @@ def gemini_json(key, parts, schema=None, timeout=120, tries=8):
         except Exception:
             time.sleep(3)
     return None
+
+
+SONG_CHECK_MODEL = 'gemini-3.5-flash'     # only for song_check (user, 2026-10-17); everything else is Flash-Lite
+SONG_CHECK_SCHEMA = {"type": "OBJECT", "properties": {"lines": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+    "n": {"type": "INTEGER"}, "how": {"type": "STRING", "enum": ["sung", "spoken", "not heard"]}}, "required": ["n", "how"]}}},
+    "required": ["lines"]}
+
+
+def song_check(key, x, lines):
+    """Lines marked as a song are checked by a stronger model, line by line: sung, spoken or not heard. Flash-Lite
+    takes narration or dialogue over music for lyrics and invents lyrics over instrumentals; on the reported cases
+    (2026-10-17: 4:36 drama, 11:11 narration, 13:42 orchestra, 13:42 real song) Flash-Lite judged 8 of 15 right,
+    3.5 Flash 14 of 15. Spoken -> shown as speech; not heard -> dropped; sung -> stays a lyric. Only pieces with a song
+    line are sent. lines: [(start, end, english)] in seconds into x. Any failure keeps the lines as they were."""
+    songs = [i for i, l in enumerate(lines) if l[2].startswith('♪')]
+    if not songs or not key:
+        return lines
+    items = [{'n': k + 1, 'from_s': round(lines[i][0], 1), 'to_s': round(lines[i][1], 1), 'english': lines[i][2].lstrip('♪ ')}
+             for k, i in enumerate(songs)]
+    prompt = ("Listen to this audio. For each subtitle line below (with the time it is shown, in seconds from the start "
+              "of the audio), say how its words are delivered: 'sung' if a voice SINGS them to a melody (a song, a choir "
+              "singing words); 'spoken' if a voice SPEAKS them, even with music playing underneath (narration, a "
+              "presenter, dialogue, poetry recitation); 'not heard' if no voice says or sings these words there (only "
+              "instrumental music, or a choir humming without words). Return {\"lines\": [{\"n\", \"how\"}]}.\n"
+              + json.dumps(items, ensure_ascii=False))
+    v = gemini_json(key, [{"inline_data": {"mime_type": "audio/flac", "data": base64.b64encode(to_flac(x)).decode()}},
+                          {"text": prompt}], SONG_CHECK_SCHEMA, model=SONG_CHECK_MODEL, tries=3)
+    got = {d.get('n'): d.get('how') for d in (v or {}).get('lines', []) if isinstance(d, dict)}
+    if len(got) < len(songs):
+        return lines
+    out, drop, spoken = list(lines), set(), 0
+    for k, i in enumerate(songs):
+        how = got.get(k + 1)
+        if how == 'spoken':
+            out[i] = (lines[i][0], lines[i][1], lines[i][2].lstrip('♪ ').strip()); spoken += 1
+        elif how == 'not heard':
+            drop.add(i)
+    if spoken or drop:
+        log('song check: %d of %d song lines are speech, %d not heard' % (spoken, len(songs), len(drop)))
+    return [l for i, l in enumerate(out) if i not in drop]
 
 
 def speech_or_music(key, flac):
@@ -1119,6 +1159,7 @@ def split_cues(text):
 
 LINGER_S = 0.4                                      # a subtitle stays at most this long after its words end
 LATE_S = 0.1                                  # most a subtitle may start after its voice (see polish)
+SPEECH_GAP_S = 1.5                                      # see speech_gaps
 SING_SHARE = 0.45                                       # see singing()
 SUNG_MAX_SPEECH = 0.5                                   # see spoken_not_sung
 NAME_SAFE_SPLIT = True                                  # see split_two
@@ -1432,17 +1473,29 @@ def speech_gaps(lines, x, min_s=4.0):
     cover = np.zeros(secs, dtype=bool)
     for st, et, en in lines:
         cover[max(0, int(st - 0.5)):max(0, min(secs, int(np.ceil(et + 0.5))))] = True
-    gaps, run = [], None
-    for s in range(secs):
-        talk = not cover[s] and voiced_seconds(x, s, s + 1) >= 0.5
-        if talk and run is None:
-            run = s
-        if (not talk or s == secs - 1) and run is not None:
-            end = s + 1 if talk else s
-            if end - run >= min_s:
-                gaps.append((float(run), float(end)))
-            run = None
-    return gaps
+    # what counts as a voice: the speech band's level (catches singing too, but also music: needs min_s) or, from
+    # 2.5 s, the Silero speech detector (speech only, so a short line someone skipped is caught: 2026-10-17 4:03:59)
+    speech = np.zeros(secs)
+    if _vad is not None:
+        try:
+            for t in _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5)):
+                for s_ in range(int(t['start'] / 16000), min(secs, int(np.ceil(t['end'] / 16000)))):
+                    speech[s_] += min(s_ + 1, t['end'] / 16000) - max(s_, t['start'] / 16000)
+        except Exception:
+            pass
+    gaps = []
+    for test, need in ((lambda s_: voiced_seconds(x, s_, s_ + 1) >= 0.5, min_s), (lambda s_: speech[s_] >= 0.5, SPEECH_GAP_S)):
+        run = None
+        for s_ in range(secs):
+            talk = not cover[s_] and test(s_)
+            if talk and run is None:
+                run = s_
+            if (not talk or s_ == secs - 1) and run is not None:
+                end = s_ + 1 if talk else s_
+                if end - run >= need and not any(g0 < end and run < g1 for g0, g1 in gaps):
+                    gaps.append((float(run), float(end)))
+                run = None
+    return sorted(gaps)
 
 
 def fill_gaps(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
@@ -1574,7 +1627,9 @@ def quiet_onsets(x, tolerant=False):
     # tolerant list only serves the look-back in timed_lines: as the main search it found too many (84% vs 97%).
     w = 35 if tolerant else 30
     run = np.convolve(quiet.astype(int), np.ones(w, dtype=int), 'full')[:m]
-    on = [j / 100 for j in range(30, m - 1) if db[j] > fl + 10 and run[j - 1] >= 30]
+    # and the sound must carry on (half of the next 0.25 s): a short noise in a quiet scene is not the voice coming
+    # back (2026-10-17 4:04:28: a line snapped 1.4 s early onto a faint knock)
+    on = [j / 100 for j in range(30, m - 1) if db[j] > fl + 10 and run[j - 1] >= 30 and (db[j:j + 25] > fl + 10).mean() >= 0.5]
     # a piece that begins inside a pause (pieces are cut at quiet moments): its first voice counts too, if all of
     # the 0.1 s+ before it in the piece is quiet (2026-10-17 news 3:45: the start was missed and shown 1.4 s late)
     first = next((j for j in range(10, min(m - 1, 30)) if db[j] > fl + 10), None)
@@ -2008,6 +2063,8 @@ class Channel(threading.Thread):
                     lines = well_aligned(self.gemini, flac, audio, secs, deadline, expect, lines)   # badly timed: ask again
                     lines = fill_gaps(self.gemini, flac, audio, secs, deadline, expect, lines)      # speech left out
                     lines = fix_foreign(self.gemini.key, lines)                                     # garbled script
+                    if time.time() < deadline - 30:
+                        lines = song_check(self.gemini.key, audio, lines)                       # 'songs' that are speech
                 if lines:                                   # timed once, here (Speech-to-Text words when configured)
                     words = stt_words(STT_KEY, audio) if STT_KEY else None
                     cues = make_cues(snap_to_speech(lines, audio, words, self.gemini.korean if self.gemini else None), voice_starts(audio), open_end=True)
