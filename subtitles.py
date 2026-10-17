@@ -317,7 +317,7 @@ def is_song(kind, ko, en):
 
 # South Korean spellings that slip into translations, and their DPRK forms
 SOUTH_TO_DPRK = [(r"\bBaekdu\b", "Paektu"), (r"\bPyeongyang\b", "Pyongyang"), (r"\bHamheung\b", "Hamhung"),
-                 (r"\b[GK]aeseong\b", "Kaesong"), (r"\bCheongjin\b", "Chongjin"), (r"\bDaedong\b", "Taedong"),
+                 (r"\b[GK]aeseong\b", "Kaesong"), (r"\bCheongjin\b", "Chongjin"), (r"\bDaedong\b", "Taedong"), (r"\bBusan\b", "Pusan"),
                  (r"\bSeodaemun\b", "Sodaemun"), (r"\bJoseon\b", "Korea"), (r"\bChosun\b", "Korea"),
                  (r"\bdeodeok\b", "todok"), (r"\bDeodeok\b", "Todok"), (r"\bKim Il-sung\b", "Kim Il Sung"),
                  (r"\bKim Jong-il\b", "Kim Jong Il"), (r"\bKim Jong-un\b", "Kim Jong Un"), (r"\bKim Jong-suk\b", "Kim Jong Suk"),
@@ -1560,7 +1560,7 @@ def word_span(ko, words, lo, hi, share=0.3):
     return st, en
 
 
-def quiet_onsets(x):
+def quiet_onsets(x, tolerant=False):
     """Where speech comes back after at least 0.3 s of quiet (10 ms frames, 10 dB over the floor)."""
     m = len(x) // 160
     if m < 60:
@@ -1569,8 +1569,17 @@ def quiet_onsets(x):
     live = db[db > -100]
     fl = np.percentile(live, 25) if len(live) else -60
     quiet = db < fl + 6
-    run = np.convolve(quiet.astype(int), np.ones(30, dtype=int), 'full')[:m]   # quiet frames in the 30 before
+    # quiet frames in the 30 before; tolerant: 30 of the 35 before, so the voice's own rise (a frame or two between
+    # quiet and voiced) can't hide its start (2026-10-17 news 3:45: a -32 dB frame between -42 and -25 dB). The
+    # tolerant list only serves the look-back in timed_lines: as the main search it found too many (84% vs 97%).
+    w = 35 if tolerant else 30
+    run = np.convolve(quiet.astype(int), np.ones(w, dtype=int), 'full')[:m]
     on = [j / 100 for j in range(30, m - 1) if db[j] > fl + 10 and run[j - 1] >= 30]
+    # a piece that begins inside a pause (pieces are cut at quiet moments): its first voice counts too, if all of
+    # the 0.1 s+ before it in the piece is quiet (2026-10-17 news 3:45: the start was missed and shown 1.4 s late)
+    first = next((j for j in range(10, min(m - 1, 30)) if db[j] > fl + 10), None)
+    if first is not None and quiet[:first].all():
+        on = [first / 100] + on
     out = []
     for t in on:
         if not out or t - out[-1] > 0.2:
@@ -1602,6 +1611,7 @@ def timed_lines(lines, x, words=None, korean=None):
     (+0.5 s: it marks words early), within 1 s; else the ordinary snap. End = where Speech-to-Text hears the line's
     last word; else where the Silero speech detector says speech stops; else Gemini's end."""
     qon = quiet_onsets(x)
+    qon_t = None
     offs = speech_ends(x)
     snapped = {l[2]: l for l in snap_to_speech_plain(lines, x)}
     sing = singing(x) if any(l[2].startswith('♪') for l in lines) else None
@@ -1636,7 +1646,18 @@ def timed_lines(lines, x, words=None, korean=None):
         # Gemini starts lines early (median 0.3 s, often 1-2 s): look further after its start than before, but only
         # when its start falls on quiet; inside ongoing speech a pause 2 s on would belong to a later clause
         after = START_AFTER_S if (not START_GUARD or voiced_seconds(x, guess, guess + 0.3) < 0.1) else 1.0
-        c = qon[(qon >= guess - START_BEFORE_S) & (qon <= guess + after)] if len(qon) else qon
+        # never before the previous line has had its own start (the speech just before belongs to it)
+        floor = (out[-1][0] + 0.6) if out else -1.0
+        c = qon[(qon >= max(guess - START_BEFORE_S, floor)) & (qon <= guess + after)] if len(qon) else qon
+        if not len(c):
+            # Gemini started late, inside the sentence (2026-10-17 news 3:45: 1.4 s late): the pause onset up to 2 s
+            # earlier, if the voice runs on from it to Gemini's start without a break
+            if qon_t is None:
+                qon_t = quiet_onsets(x, tolerant=True)
+            back = qon_t[(qon_t >= max(guess - 2.0, floor)) & (qon_t < guess - START_BEFORE_S)]
+            back = [b for b in back if voiced_seconds(x, b, guess) >= 0.7 * (guess - b)]
+            if back:
+                c = np.array(back[-1:])
         s2 = float(c[np.argmin(np.abs(c - guess))]) if len(c) else snapped.get(en, (st,))[0]
         nxt = min([l[0] for l in lines if l[0] > st + 0.3] or [len(x) / 16000])
         heard = [w for w in (words or []) if s2 - 0.1 <= w[1] < nxt - 0.1]
@@ -1649,8 +1670,10 @@ def timed_lines(lines, x, words=None, korean=None):
             # 2026-10-17 on 70 line ends both recognisers agreed on: 66% within 0.2 s, 81% within 0.5 s
             c = offs[(np.abs(offs - et) <= 1.0) & (offs > s2 + 0.3)] if len(offs) else offs
             if not len(c) and len(offs) and END_FALLBACK == 'last':
-                # no stop near Gemini's end (it can be seconds late): the last stop before it
-                c = offs[(offs > s2 + 0.3) & (offs <= et + 0.3)]
+                # no stop near Gemini's end (it can be seconds late): the last stop before it -- but not a breath
+                # mid-sentence: within 3 s of Gemini's end and keeping at least half the line (2026-10-17 news: a
+                # 12 s line was cut to 3.5 s at a breath 8.6 s before its end)
+                c = offs[(offs > s2 + 0.3) & (offs <= et + 0.3) & (offs >= et - 3.0) & (offs - s2 >= 0.5 * (et - st))]
                 c = c[-1:] if len(c) else c
             elif not len(c) and len(offs):
                 # no stop near Gemini's end (it can be seconds late): the stop nearest where a line this long ends
@@ -2274,6 +2297,7 @@ class Channel(threading.Thread):
 
 # ---------------------------------------------------------------- programme guide capture
 EPG_DIR = os.path.join(STATE_DIR, 'epg')
+EPG_LOCK = threading.Lock()
 EPG_RING_S = 1800                                           # the last 30 minutes of every channel, as hard links
 EPG_STATUS = os.path.join(EPG_DIR, 'status.json')
 SIGNON_QUIET_S, SIGNOFF_QUIET_S, MIN_ON_AIR_S = 900, 180, 1800
@@ -2295,6 +2319,15 @@ class EpgCapture:
         self.last_sound = 0
         st = self.status()
         self.signoff_hm = st.get(key, {}).get('signoff', '')
+        # survive a restart (2026-10-17: a restart just after KCTV's sign-off lost tomorrow's guide): on air since,
+        # last sound and a pending opening read are kept in the status file and taken back if still recent
+        mine = st.get(key, {})
+        if mine.get('on_since') and time.time() - mine.get('last_sound', 0) < EPG_RING_S:
+            self.on_since, self.last_sound = mine['on_since'], mine.get('last_sound', 0)
+            log(key, 'programme guide: on air since', pyongyang_hm(self.on_since), '(Pyongyang), carried over a restart')
+        if mine.get('opening_due') and time.time() - mine['opening_due'] < EPG_RING_S:
+            self.opening_due = mine['opening_due']
+        self.saved_at = 0
 
     def status(self):
         try:
@@ -2303,12 +2336,14 @@ class EpgCapture:
             return {}
 
     def note(self, **kw):
-        st = self.status()
-        st.setdefault(self.key, {}).update(kw, at=time.strftime('%F %T'))
-        try:
-            tmp = EPG_STATUS + '.tmp'; json.dump(st, open(tmp, 'w'), ensure_ascii=False, indent=1); os.replace(tmp, EPG_STATUS)
-        except Exception:
-            pass
+        with EPG_LOCK:                                   # three channels share the file
+            st = self.status()
+            st.setdefault(self.key, {}).update(kw, at=time.strftime('%F %T'))
+            try:
+                tmp = EPG_STATUS + '.tmp.%s' % self.key
+                json.dump(st, open(tmp, 'w'), ensure_ascii=False, indent=1); os.replace(tmp, EPG_STATUS)
+            except Exception:
+                pass
 
     def segment(self, path, kind):
         now = time.time()
@@ -2330,6 +2365,9 @@ class EpgCapture:
                     self.note(signon=pyongyang_hm(now))
             self.quiet_since = None
             self.last_sound = now
+            if now - self.saved_at >= 60:
+                self.saved_at = now
+                self.note(on_since=self.on_since, last_sound=now, opening_due=self.opening_due)
         else:
             if self.quiet_since is None:
                 self.quiet_since = now
@@ -2339,8 +2377,10 @@ class EpgCapture:
                     self.note(signoff=self.signoff_hm)
                     self.run('closing', self.last_sound)
                 self.on_since = None
+                self.note(on_since=None, last_sound=self.last_sound)
         if self.opening_due and now >= self.opening_due:
             self.opening_due = None
+            self.note(opening_due=None)
             self.run('opening', now)
 
     def run(self, kind, until):
