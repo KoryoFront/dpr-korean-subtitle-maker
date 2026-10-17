@@ -1,2 +1,3 @@
 numpy>=1.22
 faster-whisper>=1.0   # only for its Silero speech detector: where each subtitle ends
+demucs>=4.0          # optional: separates the voice from the music to judge song lines (sung, spoken, or invented)

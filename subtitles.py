@@ -79,6 +79,10 @@ RETENTION_S = 900                                                  # subtitle fi
 REQUEST_TIMEOUT = 60                                               # s for one Gemini answer (normally 5-15 s, much slower when Google is busy)
 BATCH_DEADLINE = 100                                               # s after a batch's first segment appeared (viewers reach it at 108 s)
 TERM_CHECK_S = 12                                                  # most time the dictionary check may take per batch
+# Live subtitles off (user, 2026-10-18: "dont do live subs for now just disable it but keep it, just do the auto
+# epg"): the service still runs for the programme guide capture and still publishes each channel's English track
+# (the master playlist lists it), with every segment empty. LIVE_SUBS=1 in the environment turns them back on.
+LIVE_SUBS = os.environ.get('LIVE_SUBS', '0') == '1'
 CC_ENABLED = False                                                 # the user wants WebVTT only: no captions inside the video
 CC_DEADLINE = 75                                                   # s after a segment appears: caption it even if the next
                                                                    # segment's subtitles are not known yet (viewers reach it at 108 s)
@@ -322,7 +326,12 @@ SOUTH_TO_DPRK = [(r"\bBaekdu\b", "Paektu"), (r"\bPyeongyang\b", "Pyongyang"), (r
                  (r"\bdeodeok\b", "todok"), (r"\bDeodeok\b", "Todok"), (r"\bKim Il-sung\b", "Kim Il Sung"),
                  (r"\bKim Jong-il\b", "Kim Jong Il"), (r"\bKim Jong-un\b", "Kim Jong Un"), (r"\bKim Jong-suk\b", "Kim Jong Suk"),
                  (r"\bRi Sol-ju\b", "Ri Sol Ju"), (r"\bKim Yo-jong\b", "Kim Yo Jong"),
-                 (r"\bKimyok\b", "Kim Hyok"), (r"\bKim Hyeok\b", "Kim Hyok")]
+                 (r"\bKimyok\b", "Kim Hyok"), (r"\bKim Hyeok\b", "Kim Hyok"),
+                 # 타도제국주의동맹 (ㅌ.ㄷ) heard as a name (2026-10-17 20:00 news: "the Paedojio Football Alliance")
+                 # 리, the distance (three-thousand-ri land, 130 ri): DPRK English writes ri; capital Li (Chinese
+                 # names, Li Qiang) is left alone (user, 2026-10-18)
+                 (r"(?<![A-Za-z'])li\b", "ri"),
+                 (r"\b(?:Paedojio|Thadoje(?:guk)?(?:ju)?(?:ui)?)(?: Football)? (?:Alliance|Union|League)\b", "Down-with-Imperialism Union")]
 # one romanized Korean syllable (DPRK McCune-Reischauer, with the South's eo/eu too), capitalised
 KO_SYL = r"(?:Kk|Tt|Pp|Ss|Jj|Ch|Kh|Th|Ph|[KNTRMPSJHGDBL])?(?:yae|wae|ae|ya|eo|eu|yo|ye|wa|oe|wo|we|wi|yu|ui|a|o|e|u|i)(?:ng|[ktlmpn])?"
 
@@ -606,14 +615,26 @@ SONG_CHECK_SCHEMA = {"type": "OBJECT", "properties": {"lines": {"type": "ARRAY",
     "required": ["lines"]}
 
 
-def song_check(key, x, lines):
+def song_check(key, x, lines, status=None, deadline=None):
     """Lines marked as a song are checked by a stronger model, line by line: sung, spoken or not heard. Flash-Lite
     takes narration or dialogue over music for lyrics and invents lyrics over instrumentals; on the reported cases
     (2026-10-17: 4:36 drama, 11:11 narration, 13:42 orchestra, 13:42 real song) Flash-Lite judged 8 of 15 right,
     3.5 Flash 14 of 15. Spoken -> shown as speech; not heard -> dropped; sung -> stays a lyric. Only pieces with a song
     line are sent. lines: [(start, end, english)] in seconds into x. Any failure keeps the lines as they were."""
     songs = [i for i, l in enumerate(lines) if l[2].startswith('♪')]
-    if not songs or not key:
+    # and spoken lines with no speech under them: lyrics Flash-Lite did not mark as a song, or words read off the
+    # screen over music (2026-10-17 day file: 154 such subtitles, 1.9%) -- decided by the voice alone (below)
+    silent = []
+    if _vad is not None and any(l[1] - l[0] >= 1.2 and not l[2].startswith('♪') for l in lines):
+        try:
+            mix = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5))
+        except Exception:
+            mix = None
+        if mix is not None:
+            silent = [i for i, (st, et, en) in enumerate(lines) if et - st >= 1.2 and not en.startswith('♪') and
+                      sum(max(0.0, min(r['end'] / 16000, et + 0.3) - max(r['start'] / 16000, st - 0.3)) for r in mix) < 0.05 * (et - st)]
+    if not key or not (songs or silent):
+        if status is not None: status['ok'] = True
         return lines
     items = [{'n': k + 1, 'from_s': round(lines[i][0], 1), 'to_s': round(lines[i][1], 1), 'english': lines[i][2].lstrip('♪ ')}
              for k, i in enumerate(songs)]
@@ -621,13 +642,32 @@ def song_check(key, x, lines):
               "of the audio), say how its words are delivered: 'sung' if a voice SINGS them to a melody (a song, a choir "
               "singing words); 'spoken' if a voice SPEAKS them, even with music playing underneath (narration, a "
               "presenter, dialogue, poetry recitation); 'not heard' if no voice says or sings these words there (only "
-              "instrumental music, or a choir humming without words). Return {\"lines\": [{\"n\", \"how\"}]}.\n"
+              "instrumental music, or a choir humming without words). The times come from a rough transcription: if "
+              "the words are sung or spoken anywhere in this audio, even at a different time, answer by how they are "
+              "delivered; 'not heard' only if nobody sings or says them at all. "
+              "Return {\"lines\": [{\"n\", \"how\"}]}.\n"
               + json.dumps(items, ensure_ascii=False))
-    v = gemini_json(key, [{"inline_data": {"mime_type": "audio/flac", "data": base64.b64encode(to_flac(x)).decode()}},
-                          {"text": prompt}], SONG_CHECK_SCHEMA, model=SONG_CHECK_MODEL, tries=3)
-    got = {d.get('n'): d.get('how') for d in (v or {}).get('lines', []) if isinstance(d, dict)}
+    def ask():
+        for attempt in range(2):                         # an incomplete answer is asked again once
+            v = gemini_json(key, [{"inline_data": {"mime_type": "audio/flac", "data": base64.b64encode(to_flac(x)).decode()}},
+                                  {"text": prompt}], SONG_CHECK_SCHEMA, model=SONG_CHECK_MODEL, tries=3)
+            got = {d.get('n'): d.get('how') for d in (v or {}).get('lines', []) if isinstance(d, dict)}
+            if len(got) >= len(songs):
+                return got
+        return {}
+    got = ask() if songs else {}
+    # The answer for narration over music changes from one asking to the next (11:11 on 2026-10-17: spoken, then
+    # sung). If any line came back sung it is asked once more, and a line either answer hears as spoken is speech.
+    left = lambda: float('inf') if deadline is None else deadline - time.time()
+    if songs and len(got) >= len(songs) and 'sung' in got.values() and left() > 60:
+        again = ask()
+        for n, how in again.items():
+            if how == 'spoken' and got.get(n) == 'sung':
+                got[n] = 'spoken'
     if len(got) < len(songs):
+        if status is not None: status['ok'] = False      # the caller must not keep this as the answer
         return lines
+    if status is not None: status['ok'] = True
     out, drop, spoken = list(lines), set(), 0
     for k, i in enumerate(songs):
         how = got.get(k + 1)
@@ -635,18 +675,181 @@ def song_check(key, x, lines):
             out[i] = (lines[i][0], lines[i][1], lines[i][2].lstrip('♪ ').strip()); spoken += 1
         elif how == 'not heard':
             drop.add(i)
+    # The model's word is not final: it calls narration over music sung and invents lyrics over a wordless choir,
+    # and changes its mind between askings (2026-10-17). Every line still marked sung, and every 'not heard', is
+    # decided by the separated voice (voice_kind); without demucs the model's answer stands.
+    # the whole piece is separated, not just the song lines: demucs's output depends on the stretch it is given, and
+    # cut to the lines it moved a borderline choir over the syllable threshold (2026-10-17 13:42:23)
+    try:
+        v = voice_track(x) if left() > len(x) / 16000 + 10 else None   # ~0.9 s a second of audio on one core
+    except Exception as e:
+        log('song check: voice separation failed: %s' % e); v = None
+    if v is not None:
+        try:
+            ts = _vad(v, _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5)) if _vad else []
+        except Exception:
+            ts = []
+        drop = set()
+        for i in songs:
+            if out[i][2].startswith('♪') or got.get(songs.index(i) + 1) == 'not heard':
+                kind, _ = voice_kind(x, v, ts, lines[i][0], lines[i][1])
+                if kind == 'speech' and out[i][2].startswith('♪'):
+                    out[i] = (lines[i][0], lines[i][1], lines[i][2].lstrip('♪ ').strip()); spoken += 1
+                elif kind == 'none':
+                    drop.add(i)
+        sung = 0
+        for i in silent:
+            kind, _ = voice_kind(x, v, ts, lines[i][0], lines[i][1])
+            if kind == 'sung':
+                out[i] = (lines[i][0], lines[i][1], '♪ ' + lines[i][2]); sung += 1
+            elif kind == 'none':
+                drop.add(i)
+        if silent:
+            log('song check: of %d spoken lines with no speech under them, %d are sung, %d have no voice' % (len(silent), sung, len([i for i in silent if i in drop])))
     if spoken or drop:
         log('song check: %d of %d song lines are speech, %d not heard' % (spoken, len(songs), len(drop)))
-    return [l for i, l in enumerate(out) if i not in drop]
+    out = [l for i, l in enumerate(out) if i not in drop]
+    if v is not None and any(l[2].startswith('♪') for l in out):
+        out = time_songs(out, v)                         # lyrics on the singer, not on Gemini's rough times
+    if status is not None: status['timed'] = v is not None
+    return out
 
 
-def speech_or_music(key, flac):
+_DEMUCS, _DEMUCS_LOCK = None, threading.Lock()
+_DEMUCS_SLOTS = threading.BoundedSemaphore(int(os.environ.get('DEMUCS_JOBS', '1')))   # separations at once
+
+
+def voice_track(x):
+    """The voice separated from the music (demucs htdemucs), at 16 kHz like x; None without demucs."""
+    global _DEMUCS
+    try:
+        import torch
+        from demucs.pretrained import get_model
+        from demucs.apply import apply_model
+        from scipy.signal import resample_poly
+    except Exception:
+        return None
+    with _DEMUCS_LOCK:
+        if _DEMUCS is None:
+            _DEMUCS = get_model('htdemucs'); _DEMUCS.eval()
+    with _DEMUCS_SLOTS:                                  # live: one at a time, one core, lowest priority: the encoders come first
+        tid = threading.get_native_id()
+        try:
+            was = os.getpriority(os.PRIO_PROCESS, tid); os.setpriority(os.PRIO_PROCESS, tid, 19)
+        except Exception:
+            was = None
+        try:
+            torch.set_num_threads(int(os.environ.get("DEMUCS_THREADS", "1")))   # 1: the work stays on this (niced) thread
+            y = torch.tensor(resample_poly(np.asarray(x, dtype=np.float32), 441, 160).astype(np.float32)).unsqueeze(0).repeat(2, 1).unsqueeze(0)
+            with torch.no_grad():
+                out = apply_model(_DEMUCS, y, split=True, overlap=0.1, progress=False)[0]
+            return resample_poly(out[_DEMUCS.sources.index('vocals')].mean(0).numpy(), 160, 441).astype(np.float32)[:len(x)]
+        finally:
+            if was is not None:
+                try:
+                    os.setpriority(os.PRIO_PROCESS, tid, was)
+                except Exception:
+                    pass
+
+
+def sung_phrases(v):
+    """Sung phrases in a separated voice track v: [(start, end)] in seconds. A phrase starts where the voice rises to
+    near its singing level (within 12 dB of the piece's loud level) after being under it for 0.15 s+, or climbs back
+    out of a breath (a dip 7 dB+ under both sides); it ends where the voice falls under that level for 0.15 s+."""
+    n = len(v) // 160
+    if n < 50:
+        return []
+    db = 20 * np.log10(np.sqrt((np.asarray(v[:n * 160], dtype=np.float32).reshape(n, 160) ** 2).mean(axis=1)) + 1e-9)
+    sm = np.convolve(db, np.ones(5) / 5, 'same')
+    loud = np.percentile(sm, 90)
+    on = sm > loud - 12
+    k = 0
+    runs = []
+    while k < n:                                         # runs of singing, closing gaps under 0.15 s
+        if not on[k]:
+            k += 1; continue
+        j = k
+        while j < n and (on[j] or (j + 15 < n and on[j:j + 15].any())):
+            j += 1
+        runs.append([k, j]); k = j
+    out = []
+    for a, b in runs:                                    # split a run at breaths
+        cuts = [a]
+        for i in range(a + 30, b - 30):
+            if sm[i] == sm[i - 5:i + 6].min() and min(sm[i - 30:i].max(), sm[i:i + 30].max()) - sm[i] >= 7:
+                top = sm[i:i + 30].max(); j = i
+                while j < b - 1 and sm[j] < top - 4:
+                    j += 1
+                if j - cuts[-1] >= 40:
+                    cuts.append(j)
+        cuts.append(b)
+        out += [(cuts[m] / 100, cuts[m + 1] / 100) for m in range(len(cuts) - 1) if cuts[m + 1] - cuts[m] >= 30]
+    return out
+
+
+def time_songs(lines, v):
+    """Lyric lines (start, end, '♪ ...') put on the singer: each start on the nearest phrase start within 1.5 s of
+    Gemini's (it is 0.5-1.3 s off either way: 2026-10-17 music video at 2:57), each end on the nearest phrase end within
+    1.5 s of Gemini's; never before the line before has started, never past the next line. Spoken lines unchanged."""
+    ph = sung_phrases(v)
+    if not ph:
+        return lines
+    starts, ends = np.array([a for a, _ in ph]), np.array([b for _, b in ph])
+    out, prev = list(lines), -1.0
+    idx = [i for i, l in enumerate(lines) if l[2].startswith('♪')]
+    for n, i in enumerate(idx):
+        st, et, en = lines[i]
+        c = starts[(starts >= max(st - SONG_SNAP_S, prev + 0.6)) & (starts <= st + SONG_SNAP_S)]
+        s2 = float(c[np.argmin(np.abs(c - st))]) if len(c) else st
+        e = ends[(ends >= et - 1.5) & (ends <= et + 1.5) & (ends > s2 + 0.5)]
+        e2 = float(e[np.argmin(np.abs(e - et))]) if len(e) else max(et, s2 + 0.5)
+        out[i] = (s2, e2, en); prev = s2
+    for n in range(len(idx) - 1):
+        a, b = out[idx[n]], out[idx[n + 1]]
+        if a[1] > b[0] - 0.08:
+            out[idx[n]] = (a[0], max(a[0] + 0.3, b[0] - 0.08), a[2])
+    return out
+
+
+def voice_kind(x, v, ts, st, et):
+    """('speech' | 'sung' | 'none', numbers) for a line at st..et of x (widened 1 s: the times are Gemini's), from its
+    separated voice v and Silero runs ts on v. Measured 2026-10-17: narration over music is talk on the voice track
+    (0.42-0.83 of the line; real lyrics 0.00); lyrics invented over instrumentals have no voice (under 10 % of
+    frames); a wordless choir under a fanfare (13:42:20-52) is a voice held flat 4-6 dB under the music with no
+    syllables, while a sung lead is within ~3 dB of it or moves in syllables."""
+    st, et = max(0.0, st - 1), min(len(x) / 16000, et + 1)
+    a, b = int(st * 16000), int(et * 16000)
+    n = (b - a) // 1600
+    if n < 5:
+        return 'sung', None
+    db = lambda z: 10 * np.log10((np.asarray(z[a:a + n * 1600], dtype=np.float32).reshape(n, 1600) ** 2).mean(axis=1) + 1e-12)
+    dv, dx = db(v), db(x)
+    on = (dv - dx) > -10
+    voice = float(on.mean())
+    level = float(np.median((dv - dx)[on])) if on.any() else -60.0
+    m = (b - a) // 160
+    env = 10 * np.log10((np.asarray(v[a:a + m * 160], dtype=np.float32).reshape(m, 160) ** 2).mean(axis=1) + 1e-12)
+    try:
+        from scipy.signal import find_peaks
+        syl = len(find_peaks(np.convolve(env, np.ones(5) / 5, 'same'), prominence=6, distance=10)[0]) / (m / 100)
+    except Exception:
+        syl = 1.0
+    talk = sum(max(0.0, min(t['end'] / 16000, et) - max(t['start'] / 16000, st)) for t in ts) / max(0.1, et - st)
+    nums = (round(voice, 2), round(level, 1), round(syl, 2), round(talk, 2))
+    if talk >= VOICE_TALK_MIN:
+        return 'speech', nums
+    if voice < SONG_VOICE_MIN or (level < SONG_LEVEL_MIN and syl < SONG_SYLLABLES_MIN):
+        return 'none', nums
+    return 'sung', nums
+
+
+def speech_or_music(key, flac, model=None):
     """(speech, singing) for a stretch of audio: a chunk that came back empty but is full of sound is usually music,
     sometimes speech Gemini skipped (2026-10-16: 144 music, 25 speech among such chunks)."""
     v = gemini_json(key, [{"inline_data": {"mime_type": "audio/flac", "data": base64.b64encode(flac).decode()}},
                           {"text": "Is anyone speaking in this audio? Is anyone singing words?"}],
                     {"type": "OBJECT", "properties": {"speech": {"type": "BOOLEAN"}, "singing": {"type": "BOOLEAN"}},
-                     "required": ["speech", "singing"]})
+                     "required": ["speech", "singing"]}, model=model)
     return (bool(v and v.get('speech')), bool(v and v.get('singing')))
 
 
@@ -1161,6 +1364,10 @@ LINGER_S = 0.4                                      # a subtitle stays at most t
 LATE_S = 0.1                                  # most a subtitle may start after its voice (see polish)
 SPEECH_GAP_S = 1.5                                      # see speech_gaps
 SING_SHARE = 0.45                                       # see singing()
+SONG_LEVEL_MIN = -3.5                                   # see voice_kind
+SONG_SYLLABLES_MIN = 0.5                                # see voice_kind
+VOICE_TALK_MIN = 0.3                                    # see voice_kind
+SONG_VOICE_MIN = 0.1                                    # see voice_kind
 SUNG_MAX_SPEECH = 0.5                                   # see spoken_not_sung
 NAME_SAFE_SPLIT = True                                  # see split_two
 READ_CPS, READ_MIN_S = 17.0, 1.2                       # reading speed and the shortest subtitle
@@ -1185,13 +1392,28 @@ def make_cues(lines, onsets=None, open_end=False):
         if not parts:
             continue
         tot = sum(len(p) for p in parts) or 1
-        cut, t = [st], st                                    # where each part starts: by its share of the characters,
+        cut, done = [st], 0                                  # where each part starts: by its share of the characters,
         for p in parts[:-1]:                                 # then moved to the speaker's pause nearby (onsets: times
-            t += (et - st) * len(p) / tot                    # the voice resumes, same clock as the lines)
+            done += len(p)                                   # the voice resumes, same clock as the lines). Each from
+            t = st + (et - st) * done / tot                  # the line's own start: a snap must not carry into the
+                                                             # next (2026-10-18 news 0:45: a part ran past the line)
             if onsets is not None and len(onsets) and not song:
-                c = onsets[(onsets >= max(t - 0.8, cut[-1] + 0.8)) & (onsets <= min(t + 0.8, et - 0.6))]
-                if len(c):
-                    t = float(c[np.argmin(np.abs(c - t))])
+                on = np.asarray(onsets)
+                ot = on[:, 0] if on.ndim == 2 else on
+                inside = (ot >= cut[-1] + 0.8) & (ot <= et - 0.6)
+                ok = inside & (np.abs(ot - t) <= 0.8)
+                if on.ndim == 2:                         # a real pause (0.2 s+) is looked for further: 1.5 s
+                    ok |= inside & (np.abs(ot - t) <= 1.5) & (on[:, 1] >= 0.2)
+                if ok.any():
+                    if on.ndim == 2 and on[ok, 1].max() >= 0.12:
+                        # the speaker's break: the longest quiet before a restart (2026-10-17 day file: placed by
+                        # length the second part came 0.4-1.4 s after its words, at a gap between syllables)
+                        c = on[ok]
+                        t = float(c[np.argmax(c[:, 1] - 0.1 * np.abs(c[:, 0] - t)), 0])
+                    else:
+                        c = ot[ok]
+                        t = float(c[np.argmin(np.abs(c - t))])
+            t = min(max(t, cut[-1] + 0.5), et - 0.5)       # in order, inside the line
             cut.append(t)
         cut.append(et)
         for k, p in enumerate(parts):                        # [4]: where the words end; [5]: starts on the voice
@@ -1201,6 +1423,12 @@ def make_cues(lines, onsets=None, open_end=False):
         nxt = cues[i + 1][0] if i + 1 < len(cues) else c[0] + 7.0
         want = max(1.0, len(c[2]) / 17.0)
         c[1] = max(c[1], min(c[0] + want, nxt - 0.08))                     # long enough to read, if there is room
+        if c[3] and SONG_RAW:
+            # lyrics keep Gemini's times exactly (user, 2026-10-18: "music is sometimes slow"): only cut short where
+            # the next subtitle begins
+            c[1] = min(c[4], nxt - 0.08) if i + 1 < len(cues) else c[4]
+            c[1] = max(c[1], c[0] + 0.3)
+            continue
         if c[3]:
             # a sung line stays up through its held notes: until the next lyric (if it follows within 3 s; user,
             # 2026-10-17: "lines end early due to long held notes"), at most 7 s
@@ -1237,8 +1465,11 @@ def polish(cues):
     # room for the one before (a reader notices more than that; 2026-10-16 schedule read 0.6-1 s late). The middle
     # parts of a long line were placed by length, so they may move further.
     late = lambda c: LATE_S if len(c) > 5 and c[5] else 1.0
+    fixed = lambda c: SONG_RAW and c[3]                  # a lyric keeps Gemini's times: nothing here moves it
     for i in range(len(out) - 1):
         a, b = out[i], out[i + 1]
+        if fixed(a) or fixed(b):
+            continue
         if a[1] - a[0] < 0.83 and b[1] - b[0] > 1.6:
             need = min(0.83 - (a[1] - a[0]), (b[1] - b[0]) - 1.2)
             if b[0] - a[1] < need + 0.08:
@@ -1248,14 +1479,14 @@ def polish(cues):
     # broadcast TV), then time the next subtitle can spare (it starts a little later but keeps enough for its own text)
     for i, c in enumerate(out):
         need = len(c[2]) / 17.0 - (c[1] - c[0])
-        if need <= 0 or len(c[2]) / max(0.1, c[1] - c[0]) <= 20:
+        if need <= 0 or len(c[2]) / max(0.1, c[1] - c[0]) <= 20 or fixed(c):
             continue
         free_before = c[0] - (out[i - 1][1] + 0.08 if i else 0)
         lead = max(0.0, min(LEAD_S, free_before, need))
         c[0] -= lead; need -= lead
         if need > 0 and i + 1 < len(out):
             n = out[i + 1]
-            spare = (n[1] - n[0]) - max(0.83, len(n[2]) / 17.0)
+            spare = 0.0 if fixed(n) else (n[1] - n[0]) - max(0.83, len(n[2]) / 17.0)
             take = max(0.0, min(need, spare, late(n)))
             if take > 0:
                 n[0] += take
@@ -1266,7 +1497,7 @@ def polish(cues):
         if i + 1 < len(out) and out[i + 1][0] - c[1] < 0.08 and out[i + 1][0] - c[0] < 0.91:
             c[1] = out[i + 1][0] - 0.08                     # it runs into the next one: measured as it will be shown
         need = 0.83 - (c[1] - c[0])
-        if need <= 0:
+        if need <= 0 or fixed(c):
             continue
         # never by starting earlier (user, 2026-10-17: "lines show before it is said"): only into free time after
         nxt = out[i + 1][0] - 0.08 if i + 1 < len(out) else c[1] + need
@@ -1279,7 +1510,7 @@ def polish(cues):
             p = merged[-1]
             short = (p[1] - p[0] < READ_MIN_S) or (c[1] - c[0] < READ_MIN_S)
             joined = p[2] + ' ' + c[2]
-            if (short and p[3] == c[3] and c[0] - p[1] <= 0.3 and c[1] - p[0] <= 7.0 and split_two(joined)
+            if (short and p[3] == c[3] and not fixed(c) and c[0] - p[1] <= 0.3 and c[1] - p[0] <= 7.0 and split_two(joined)
                     and len(joined) <= 2 * LINE):
                 p[1], p[2], p[4] = c[1], joined, c[4]
                 continue
@@ -1287,21 +1518,28 @@ def polish(cues):
     out = merged
     for i in range(1, len(out)):
         a, b = out[i - 1], out[i]
-        if b[0] < a[1] + 0.08 and a[1] - a[0] <= 0.9 and b[1] - (a[1] + 0.08) >= 1.2 and a[1] + 0.08 - b[0] <= late(b):
+        if b[0] < a[1] + 0.08 and a[1] - a[0] <= 0.9 and b[1] - (a[1] + 0.08) >= 1.2 and a[1] + 0.08 - b[0] <= late(b) and not fixed(b):
             b[0] = a[1] + 0.08                      # a short line keeps its time; the long next one starts a moment later
         if out[i][0] < out[i - 1][1] + 0.08:
             out[i - 1][1] = max(out[i - 1][0] + 0.5, out[i][0] - 0.08)
-            if out[i][0] < out[i - 1][1] + 0.08:                 # still overlapping: the next one starts a moment later
+            if out[i][0] < out[i - 1][1] + 0.08 and not fixed(out[i]):   # still overlapping: the next one starts a moment later
                 out[i][0] = out[i - 1][1] + 0.08
                 out[i][1] = max(out[i][1], out[i][0] + 0.5)
     return out
 
 
+SONG_SNAP_S = 1.5          # see time_songs
+SONG_RAW = True            # user, 2026-10-18: lyrics on Gemini's own start and end, nothing snapped or stretched
+SONG_MARKS = False          # user, 2026-10-18: no music notes, lyrics shown like any other line (telling singing
+                            # from speech over music was never reliable); songs are still timed as songs inside
+
+
 def song_marks(rows):
-    """Sung lyrics: a music note at the start of the first line and the end of the last (♪ ... ♪)."""
+    """Sung lyrics: shown as they are (SONG_MARKS: a music note at the start of the first line and the end of the last)."""
     rows = list(rows)
-    rows[0] = '♪ ' + rows[0]
-    rows[-1] = rows[-1] + ' ♪'
+    if SONG_MARKS:
+        rows[0] = '♪ ' + rows[0]
+        rows[-1] = rows[-1] + ' ♪'
     return '\n'.join(rows)
 
 
@@ -1404,10 +1642,28 @@ def vocal_starts(x, depth=8.0):
     return np.array(out)
 
 
-def voice_starts(x):
+def voice_starts(x, pauses=False):
     """Every place the voice starts or resumes in x: after silence (speech_onsets) or after a short pause (pause_ends).
-    make_cues puts the break between two parts of a long line on one of these."""
-    return np.unique(np.round(np.concatenate([speech_onsets(x), pause_ends(x)]), 2))   # (vocal_starts fired on every syllable)
+    make_cues puts the break between two parts of a long line on one of these. pauses: rows of (time, seconds of quiet
+    just before it, up to 1 s) -- these places come every 0.3-0.8 s (gaps between syllables too), and the speaker's
+    real break between phrases is the one after the longest quiet."""
+    t = np.unique(np.round(np.concatenate([speech_onsets(x), pause_ends(x)]), 2))   # (vocal_starts fired on every syllable)
+    if not pauses:
+        return t
+    m = len(x) // 160
+    if m < 10 or not len(t):
+        return np.zeros((0, 2))
+    db = 20 * np.log10(np.sqrt((x[:m * 160].reshape(m, 160).astype(np.float32) ** 2).mean(axis=1)) + 1e-9)
+    live = db[db > -100]
+    quiet = db < (np.percentile(live, 25) if len(live) else -60) + 6
+    out = []
+    for v in t:
+        j = min(m, int(round(v * 100))) - 3                # the voice's own rise (a frame or two) is not counted
+        k = j
+        while k > 0 and j - k < 100 and quiet[k - 1]:
+            k -= 1
+        out.append((v, (j - k) / 100))
+    return np.array(out)
 
 
 def align_score(lines, x):
@@ -1559,6 +1815,11 @@ STT_KEY = None                                          # set from the config (s
 EXTEND_ENDS = False                                     # (Speech-to-Text only) tested: no better
 WORD_GAP_ENDS = False                                   # (Speech-to-Text only) tested: worse
 END_TRIM_S = 0.1                                        # Silero stops a little late
+INSPEECH_KEEP = os.environ.get('INSPEECH_KEEP', '0') == '1'   # tested 2026-10-18: clear starts 97->91%, no gain inside speech
+INSPEECH_MIN = float(os.environ.get('INSPEECH_MIN', '0.3'))
+INSPEECH_SNAP = float(os.environ.get('INSPEECH_SNAP', '0.3'))   # a real pause onset this close still wins
+INSPEECH_SHIFT = float(os.environ.get('INSPEECH_SHIFT', '0.0'))
+PIECE_START_KEEP = os.environ.get('PIECE_START_KEEP', '0') == '1'   # tested 2026-10-18: hurt clear starts
 START_GUARD = False                                     # tested: the guard blocked most of the gain
 START_BEFORE_S, START_AFTER_S = 0.8, 2.0                # pause onset search around Gemini's start (tested)
 END_FALLBACK = 'last'                                   # see timed_lines
@@ -1632,8 +1893,9 @@ def quiet_onsets(x, tolerant=False):
     on = [j / 100 for j in range(30, m - 1) if db[j] > fl + 10 and run[j - 1] >= 30 and (db[j:j + 25] > fl + 10).mean() >= 0.5]
     # a piece that begins inside a pause (pieces are cut at quiet moments): its first voice counts too, if all of
     # the 0.1 s+ before it in the piece is quiet (2026-10-17 news 3:45: the start was missed and shown 1.4 s late)
-    first = next((j for j in range(10, min(m - 1, 30)) if db[j] > fl + 10), None)
-    if first is not None and quiet[:first].all():
+    first = next((j for j in range(10, min(m - 1, 150)) if db[j] > fl + 10), None)   # up to 1.5 s in (2026-10-18:
+    # 20:00 news 26:36, speech 0.7 s into a piece was missed and the line snapped 1.7 s on to the next pause)
+    if first is not None and quiet[:max(1, first - 25)].all():   # (the voice's own rise, up to 0.25 s, not counted)
         on = [first / 100] + on
     out = []
     for t in on:
@@ -1669,11 +1931,13 @@ def timed_lines(lines, x, words=None, korean=None):
     qon_t = None
     offs = speech_ends(x)
     snapped = {l[2]: l for l in snap_to_speech_plain(lines, x)}
-    sing = singing(x) if any(l[2].startswith('♪') for l in lines) else None
+    sing = singing(x) if not SONG_RAW and any(l[2].startswith('♪') for l in lines) else None
     talk = None
     out = []
     for i, (st, et, en) in enumerate(lines):
         if en.startswith('♪'):
+            if SONG_RAW:                                 # Gemini's own times (user, 2026-10-18)
+                out.append((st, et, en)); continue
             # a lyric stays up while the singer still sings (held notes), up to the next line and 7 s
             if sing is not None:
                 nxt = min([l[0] for l in lines if l[0] > st + 0.3] or [len(x) / 16000])
@@ -1709,11 +1973,47 @@ def timed_lines(lines, x, words=None, korean=None):
             # earlier, if the voice runs on from it to Gemini's start without a break
             if qon_t is None:
                 qon_t = quiet_onsets(x, tolerant=True)
-            back = qon_t[(qon_t >= max(guess - 2.0, floor)) & (qon_t < guess - START_BEFORE_S)]
+            # (and up to just after Gemini's start: a tolerant onset 0.46 s before it was in neither search, 2026-10-17
+            # 13:06:13 shown 0.67 s late)
+            back = qon_t[(qon_t >= max(guess - 2.0, floor)) & (qon_t < guess + 0.1)]
             back = [b for b in back if voiced_seconds(x, b, guess) >= 0.7 * (guess - b)]
             if back:
                 c = np.array(back[-1:])
+        if not len(c) and _vad is not None:
+            # no pause onset near: before taking the plain snap (which lands on any sound, a knock or a door), take
+            # where the speech detector hears speech begin, if no speech runs at Gemini's start nor at the snap (2026-10-17 4:04:28:
+            # "What have you done?" snapped onto a bang 1.4 s before the words)
+            if talk is None:
+                try:
+                    talk = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5))
+                except Exception:
+                    talk = []
+            p = snapped.get(en, (st,))[0]
+            if not any(t['start'] / 16000 <= guess < t['end'] / 16000 for t in talk) and \
+                    not any(p - 0.1 <= t['start'] / 16000 <= p + 0.4 or t['start'] / 16000 <= p < t['end'] / 16000 for t in talk):
+                ss = [t['start'] / 16000 for t in talk if max(guess - START_BEFORE_S, floor) <= t['start'] / 16000 <= guess + START_AFTER_S]
+                if ss:
+                    if qon_t is None:
+                        qon_t = quiet_onsets(x, tolerant=True)
+                    q = qon_t[(qon_t >= ss[0] - 0.3) & (qon_t <= ss[0] + 0.05)] if len(qon_t) else qon_t
+                    c = np.array([float(q[-1]) if len(q) else ss[0] - 0.05])   # Silero starts a little late
         s2 = float(c[np.argmin(np.abs(c - guess))]) if len(c) else snapped.get(en, (st,))[0]
+        if INSPEECH_KEEP and talk is None and _vad is not None:
+            try:
+                talk = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5))
+            except Exception:
+                talk = []
+        if INSPEECH_KEEP and talk and not (len(qon) and np.min(np.abs(qon - s2)) < 0.01 and abs(s2 - guess) <= INSPEECH_SNAP):
+            # Gemini's start inside speech that runs on through it (Silero): the line begins mid-utterance, where no
+            # pause marks it; snapping moved it onto the next small gap, later than both recognisers put it
+            # (2026-10-18, lines both agree on: median +0.42 s snapped vs +0.17 s as Gemini gave it)
+            if any(t['start'] / 16000 <= guess - INSPEECH_MIN and t['end'] / 16000 >= guess + 0.3 for t in talk):
+                s2 = guess + INSPEECH_SHIFT
+        if PIECE_START_KEEP and guess < 0.3 and s2 > guess + 0.3 and talk and \
+                any(t['start'] / 16000 <= 0.3 and t['end'] / 16000 >= s2 for t in talk):
+            # the piece begins in the middle of speech and so does the line: it starts with the piece (held-out
+            # 2026-10-17: such lines were moved 0.6-1.4 s on to the first pause)
+            s2 = max(0.0, guess)
         nxt = min([l[0] for l in lines if l[0] > st + 0.3] or [len(x) / 16000])
         heard = [w for w in (words or []) if s2 - 0.1 <= w[1] < nxt - 0.1]
         if span and span[1] is not None and span[1] > s2 + 0.3:
@@ -2064,10 +2364,10 @@ class Channel(threading.Thread):
                     lines = fill_gaps(self.gemini, flac, audio, secs, deadline, expect, lines)      # speech left out
                     lines = fix_foreign(self.gemini.key, lines)                                     # garbled script
                     if time.time() < deadline - 30:
-                        lines = song_check(self.gemini.key, audio, lines)                       # 'songs' that are speech
+                        lines = song_check(self.gemini.key, audio, lines, deadline=deadline - 15)                       # 'songs' that are speech
                 if lines:                                   # timed once, here (Speech-to-Text words when configured)
                     words = stt_words(STT_KEY, audio) if STT_KEY else None
-                    cues = make_cues(snap_to_speech(lines, audio, words, self.gemini.korean if self.gemini else None), voice_starts(audio), open_end=True)
+                    cues = make_cues(snap_to_speech(lines, audio, words, self.gemini.korean if self.gemini else None), voice_starts(audio, pauses=True), open_end=True)
                 else:
                     cues = []
                 if cues and self.gemini and time.time() < deadline - 20:
@@ -2327,7 +2627,9 @@ class Channel(threading.Thread):
                         self.epg.segment(os.path.join(self.cfg['dir'], d['name']), d['kind'])
                     except Exception as e:
                         log(self.cfg['key'], 'programme guide capture error', type(e).__name__)
-                if d['kind'] == 'sound':
+                if d['kind'] == 'sound' and not LIVE_SUBS:
+                    self.finish(d['seq'], [])                   # live subtitles off: the English track stays, empty
+                elif d['kind'] == 'sound':
                     self.pending.append(d['seq'])
                 else:
                     self.flush(final=True)                      # sound ended: send what is waiting first

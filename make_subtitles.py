@@ -487,7 +487,7 @@ def count_packets(path):
 # ---------------------------------------------------------------- the full live method, when its files are here
 # subtitles.py (the live service's engine) and data/search.db sit next to this script in the project: it then makes
 # subtitles exactly as the live service does
-# (house style, DPRK names and place names, the Samhung dictionary looked up by Gemini, songs as ♪ lyrics ♪).
+# (house style, DPRK names and place names, the Samhung dictionary looked up by Gemini, songs as plain lines, timed on the singer).
 # Without them it uses the built-in method above.
 HERE = os.path.dirname(os.path.abspath(__file__))
 _DB, _XZ = os.path.join(HERE, 'data', 'search.db'), os.path.join(HERE, 'data', 'search.db.xz')

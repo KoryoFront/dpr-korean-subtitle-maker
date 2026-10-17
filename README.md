@@ -18,6 +18,7 @@ For `recording.ts` it writes, next to it:
 - ffmpeg and ffprobe on the PATH: https://ffmpeg.org/download.html
 - Recommended: MKVToolNix (mkvmerge) on the PATH, for the smoothest MKV with interlaced TV pictures: https://mkvtoolnix.download
   (without it, ffmpeg builds the MKV)
+- Optional: demucs (in requirements.txt), which separates the voice from the music so lines marked as song lyrics are checked against the sound: narration over music is shown as speech, lyrics heard over instrumental music or a wordless choir are dropped, and each lyric starts and ends with the singer's phrase instead of Gemini's rough times. Without it Gemini's judgement and times stand. Lyrics are shown as plain subtitles, without music notes.
 - A Gemini API key, either:
   - Google AI Studio, with billing (prepaid credit) enabled: https://aistudio.google.com
   - or a Vertex AI API key (starts `AQ.`) from a Google Cloud project with billing enabled, so Google Cloud credits
