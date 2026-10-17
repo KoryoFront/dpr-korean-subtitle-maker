@@ -299,6 +299,7 @@ KO_SYL = r"(?:Kk|Tt|Pp|Ss|Jj|Ch|Kh|Th|Ph|[KNTRMPSJHGDBL])?(?:yae|wae|ae|ya|eo|eu
 def dprk_english(t):
     """Safety net for the house style: the DPRK never calls itself 'North Korea'."""
     t = re.sub(r"\bNorth Korean\b", "Korean", t)
+    t = t.replace('℃', '°C').replace('℉', '°F')
     t = re.sub(r"\b[Tt]he North Korea\b|\bNorth Korea\b", "the DPRK", t)
     # DPRK names never take a hyphen: "Pang Thae-so" -> "Pang Thae So" (only a short syllable after a surname, so
     # ordinary English words like "self-reliance" are left alone)
@@ -1284,6 +1285,72 @@ def well_aligned(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
     return best
 
 
+FOREIGN = re.compile(r'[^\x00-\x7F♪‘’“”—–…°·éèêáàâüöäïçñ]')
+
+
+def fix_foreign(key, lines):
+    """A line with letters of another script in its English (2026-10-16: "Let's produce zოკარო using milk", a garbled
+    요구르트 = yoghurt): Gemini rewrites just that word in English, from the lines around it. Other lines untouched."""
+    bad = [i for i, l in enumerate(lines) if FOREIGN.search(l[2].lstrip('♪ '))]
+    if not bad or not key:
+        return lines
+    lines = list(lines)
+    items = [{'n': i, 'before': lines[i - 1][2] if i else '', 'line': lines[i][2],
+              'after': lines[i + 1][2] if i + 1 < len(lines) else ''} for i in bad]
+    prompt = ("These English subtitles of DPRK television contain a word in the wrong script: a Korean word "
+              "garbled in transcription. Replace only that word with the English word it most likely is (from the "
+              "context: e.g. a dairy product made from milk is 'yoghurt'), keep every other word exactly. " + DPRK_STYLE +
+              ' Return {"lines": [...]}, one string per item, in order.\n' + json.dumps(items, ensure_ascii=False))
+    v = gemini_json(key, [{"text": prompt}], {"type": "OBJECT", "properties": {"lines": {"type": "ARRAY", "items": {"type": "STRING"}}}, "required": ["lines"]})
+    out = (v or {}).get('lines') or []
+    for i, new in zip(bad, out if len(out) == len(bad) else []):
+        new = str(new).strip()
+        if new and not FOREIGN.search(new) and abs(len(new.split()) - len(lines[i][2].split())) <= 2:
+            log('foreign letters fixed: %r -> %r' % (lines[i][2], new))
+            lines[i] = (lines[i][0], lines[i][1], ('♪ ' if lines[i][2].startswith('♪') and not new.startswith('♪') else '') + new) + tuple(lines[i][3:])
+    return lines
+
+
+def speech_gaps(lines, x, min_s=4.0):
+    """Stretches (start, end) of x with speech but no line: whole seconds with 0.5 s+ of voice, not within 0.5 s of
+    any line, at least min_s long. Gemini sometimes stops early (2026-10-16 12:55: the last 16 s of a chunk) or
+    skips a stretch; music without a voice scores low and is not counted."""
+    secs = int(len(x) / 16000)
+    cover = np.zeros(secs, dtype=bool)
+    for st, et, en in lines:
+        cover[max(0, int(st - 0.5)):max(0, min(secs, int(np.ceil(et + 0.5))))] = True
+    gaps, run = [], None
+    for s in range(secs):
+        talk = not cover[s] and voiced_seconds(x, s, s + 1) >= 0.5
+        if talk and run is None:
+            run = s
+        if (not talk or s == secs - 1) and run is not None:
+            end = s + 1 if talk else s
+            if end - run >= min_s:
+                gaps.append((float(run), float(end)))
+            run = None
+    return gaps
+
+
+def fill_gaps(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
+    """Speech left without subtitles (speech_gaps): ask Gemini again for the chunk and take only the new lines that
+    fall in the gaps and touch no line already there. Lines are snapped to the voice like the rest."""
+    for attempt in range(tries):
+        gaps = speech_gaps(lines, x)
+        if not gaps or time.time() > deadline - 20:
+            break
+        new = gemini.subtitles(flac, seconds, deadline, expect)
+        if not new:
+            continue
+        add = [l for l in snap_to_speech(new, x)
+               if any(g0 - 1 <= (l[0] + l[1]) / 2 <= g1 + 1 for g0, g1 in gaps)
+               and not any(l[0] < et and st < l[1] for st, et, en in lines)]
+        if add:
+            log('filled %d s of speech without subtitles with %d line(s)' % (sum(g1 - g0 for g0, g1 in gaps), len(add)))
+            lines = sorted(list(lines) + add)
+    return lines
+
+
 def snap_to_speech(lines, x):
     """Gemini's times are rough (~0.5 s). Move each line's start to where speech actually starts nearby (and its end to
     where it stops), from the sound itself: phrase-level activity = frames well above the noise floor, smoothed over
@@ -1380,7 +1447,7 @@ def tidy_lines(lines):
     # A line that repeats the one just before it (a refrain heard twice in one answer) is dropped.
     kept = []
     for a, b, t in sorted(lines, key=lambda x: (x[0], x[1])):
-        if kept and a - kept[-1][1] < 8 and repeats(t.lstrip('♪ '), [kept[-1][2].lstrip('♪ ')]) and len(content_words(t)) >= 2:
+        if kept and a - kept[-1][1] < 8 and repeats(t.lstrip('♪ '), [kept[-1][2].lstrip('♪ ')], 0.85) and len(content_words(t)) >= 2:
             continue
         kept.append((a, b, t))
     lines = kept
@@ -1420,18 +1487,25 @@ def pts_diff(a, b):
 EMPTY_VTT = 'WEBVTT\n'                                            # shared by every segment with nothing to show
 
 
+STOPWORDS = set('this that these those with have from will they them their there what when where which while would '
+                'could should about into your yours been were also very just than then here such some more most much '
+                'only over like make made does done said says each'.split())
+
+
 def content_words(t):
-    return {w for w in re.findall(r"[a-z0-9']+", t.lower()) if len(w) > 3}
+    """The words that carry meaning: longer than three letters, not a common function word ("How is this production
+    guaranteed?" and "This production process is similar." share only "production")."""
+    return {w for w in re.findall(r"[a-z0-9']+", t.lower()) if len(w) > 3 and w not in STOPWORDS}
 
 
-def repeats(text, shown):
+def repeats(text, shown, share=0.6):
     """The second pass over a carried segment says again what was just shown ("activities, including cooking
     practice" after "...art activities, and cooking practice"): most of its words are already on screen."""
     words = content_words(text)
     if not words:
         return False
     seen = set().union(*(content_words(t) for t in shown)) if shown else set()
-    return len(words & seen) / len(words) >= 0.6
+    return len(words & seen) / len(words) >= share
 
 
 # ---------------------------------------------------------------- one channel
@@ -1554,6 +1628,8 @@ class Channel(threading.Thread):
                     lines = recheck_empty(self.gemini.key, audio, secs, self.gemini) or []   # music, or skipped speech
                 if lines and self.gemini:
                     lines = well_aligned(self.gemini, flac, audio, secs, deadline, expect, lines)   # badly timed: ask again
+                    lines = fill_gaps(self.gemini, flac, audio, secs, deadline, expect, lines)      # speech left out
+                    lines = fix_foreign(self.gemini.key, lines)                                     # garbled script
                 cues = make_cues(snap_to_speech(lines, audio), voice_starts(audio)) if lines else []
                 if cues and self.gemini and time.time() < deadline - 20:
                     cues = condense_cues(self.gemini.key, cues)                         # too dense to read: shorten

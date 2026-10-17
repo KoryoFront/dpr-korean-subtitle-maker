@@ -613,6 +613,11 @@ def main():
                 # snapped to the voice; a chunk Gemini timed badly is asked again and the best-aligned answer kept
                 g = _live_gemini.setdefault(key, LIVE.Gemini(key))
                 out = LIVE.well_aligned(g, to_flac(xc), xc, float(c1 - c0), time.time() + 300, True, [tuple(x) for x in out])
+                if LIVE.speech_gaps(out, xc):          # speech Gemini left without lines: asked again for those stretches
+                    out = LIVE.fill_gaps(g, to_flac(xc), xc, float(c1 - c0), time.time() + 300, True, out)
+                    with open(f + '.tmp', 'w', encoding='utf-8') as fh:
+                        json.dump(out, fh, ensure_ascii=False)
+                    os.replace(f + '.tmp', f)
             else:
                 out = snap_to_speech([tuple(x) for x in out], xc)
             if LIVE:
@@ -633,6 +638,7 @@ def main():
             say('reading the sound timestamps ...')
             tl = LIVE.audio_timeline(cut)                  # decoded time drifts from the recording's clock (~0.06 s/h)
             T = lambda v: LIVE.to_timeline(v, tl) + a_off
+            lines = LIVE.fix_foreign(key, sorted(lines))   # a word in the wrong script (garbled Korean) -> English
             cues = LIVE.make_cues([(T(s), T(e), LIVE.dprk_english(t)) for s, e, t in lines],
                                   T(np.sort(np.concatenate(starts))) if starts else None)
             say('shortening subtitles too dense to read ...')
