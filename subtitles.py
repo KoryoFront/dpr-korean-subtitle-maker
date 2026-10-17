@@ -21,7 +21,7 @@ English by a Groq text model, and timed to the video with X-TIMESTAMP-MAP.
 Config: /etc/stream-gui/subtitles.json  {"groq_key": "..."} (root, 0600)
         /etc/stream-server.env          R2_* (the uploader's own credentials)
 """
-import base64, datetime, heapq, hashlib, hmac, http.client, json, os, re, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import base64, datetime, difflib, heapq, hashlib, hmac, http.client, json, os, re, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -561,6 +561,8 @@ class Gemini:
                     en = dprk_english(en)
                     note_unknown_words(en, ko)
                     out.append((st, et, ('♪ ' + en) if is_song(kind, ko, en) else en))
+                    if len(self.korean) > 20000:
+                        self.korean.clear()               # live runs for days: keep it bounded
                     self.korean[out[-1][2]] = ko          # kept so a recording can be re-timed later from the words
                 return out
             except urllib.error.HTTPError as e:
@@ -1450,35 +1452,147 @@ def speech_ends(x):
     return np.array([t['end'] / 16000 for t in ts])
 
 
-SNAP_LINES = False   # starts: Gemini's own (user, 2026-10-17, and the A/B test below); ends: snapped to the voice.
+CHUNK_SHIFT = False       # whole-chunk shift: measured worse (31 of 84 lines moved the wrong way), off
+FORWARD_SILENT = True     # a line starting on quiet moves to the next onset
+SNAP_LINES = False
+HANGUL = re.compile(r'[가-힣0-9]')
+STT_KEY = None                                          # set from the config (stt_key) by main()
+EXTEND_ENDS = False                                     # (Speech-to-Text only) tested: no better
+WORD_GAP_ENDS = False                                   # (Speech-to-Text only) tested: worse
+END_TRIM_S = 0.1                                        # Silero stops a little late
+SYLLABLE_S = 0.169                                      # measured KCTV pace: seconds per Korean syllable
+
+
+def stt_words(key, x, tries=3):
+    """Korean words with times (s into x) from Google Speech-to-Text, or None (no key, or it failed). Used only for
+    timing: which stretch of sound is which line (the text comes from Gemini)."""
+    if not key or len(x) < 16000:
+        return None
+    pcm = (np.clip(x, -1, 1) * 32767).astype('<i2').tobytes()
+    body = json.dumps({"config": {"encoding": "LINEAR16", "sampleRateHertz": 16000, "languageCode": "ko-KR",
+                       "enableWordTimeOffsets": True, "model": "default"},
+                       "audio": {"content": base64.b64encode(pcm).decode()}}).encode()
+    for attempt in range(tries):
+        try:
+            r = json.load(urllib.request.urlopen(urllib.request.Request(
+                'https://speech.googleapis.com/v1/speech:recognize', data=body,
+                headers={'Content-Type': 'application/json', 'x-goog-api-key': key}), timeout=60))
+            return [(w['word'], float(w['startTime'][:-1]), float(w['endTime'][:-1]))
+                    for res in r.get('results', []) for w in res['alternatives'][0].get('words', [])]
+        except Exception as e:
+            log('Speech-to-Text failed: %s' % str(e)[:80])
+            time.sleep(2 * (attempt + 1))
+    return None
+
+
+def word_span(ko, words, lo, hi, share=0.3):
+    """(start, end) of a line's Korean among recognised words between lo and hi, letter by letter; an edge is None
+    unless the line's first/last letters themselves were matched; None if under half the line matched."""
+    ch, tm = [], []
+    for w, a, b in words:
+        if lo <= a <= hi:
+            cs = HANGUL.findall(w)
+            for i, c in enumerate(cs):
+                ch.append(c); tm.append((a + (b - a) * i / len(cs), a + (b - a) * (i + 1) / len(cs)))
+    k = ''.join(HANGUL.findall(ko or ''))
+    if len(k) < 4 or not ch:
+        return None
+    blocks = [b for b in difflib.SequenceMatcher(None, k, ''.join(ch), autojunk=False).get_matching_blocks() if b.size >= 2]
+    if sum(b.size for b in blocks) < share * len(k):
+        return None
+    st = tm[blocks[0].b][0] if blocks[0].a <= 2 else None
+    en = tm[blocks[-1].b + blocks[-1].size - 1][1] if blocks[-1].a + blocks[-1].size >= len(k) - 2 else None
+    if en is None and EXTEND_ENDS:                       # the last letters were not heard: carry on at the line's pace
+        left = len(k) - (blocks[-1].a + blocks[-1].size)
+        last = tm[blocks[-1].b + blocks[-1].size - 1][1]
+        pace = (last - tm[blocks[0].b][0]) / max(1, blocks[-1].a + blocks[-1].size - blocks[0].a)
+        if left <= 8:
+            en = last + left * min(max(pace, 0.08), 0.25)
+    return st, en
+
+
+def quiet_onsets(x):
+    """Where speech comes back after at least 0.3 s of quiet (10 ms frames, 10 dB over the floor)."""
+    m = len(x) // 160
+    if m < 60:
+        return np.array([])
+    db = 20 * np.log10(np.sqrt((x[:m * 160].reshape(m, 160).astype(np.float32) ** 2).mean(axis=1)) + 1e-9)
+    live = db[db > -100]
+    fl = np.percentile(live, 25) if len(live) else -60
+    quiet = db < fl + 6
+    run = np.convolve(quiet.astype(int), np.ones(30, dtype=int), 'full')[:m]   # quiet frames in the 30 before
+    on = [j / 100 for j in range(30, m - 1) if db[j] > fl + 10 and run[j - 1] >= 30]
+    out = []
+    for t in on:
+        if not out or t - out[-1] > 0.2:
+            out.append(t)
+    return np.array(out)
+
+
+def timed_lines(lines, x, words=None, korean=None):
+    """The timing, as measured best (2026-10-17, against clear speech starts and two recognisers' word ends):
+    start = the point where speech resumes after a pause nearest to the mean of Gemini's start and Speech-to-Text's
+    (+0.5 s: it marks words early), within 1 s; else the ordinary snap. End = where Speech-to-Text hears the line's
+    last word; else where the Silero speech detector says speech stops; else Gemini's end."""
+    qon = quiet_onsets(x)
+    offs = speech_ends(x)
+    snapped = {l[2]: l for l in snap_to_speech_plain(lines, x)}
+    out = []
+    for st, et, en in lines:
+        if en.startswith('♪'):
+            out.append((st, et, en)); continue
+        span = word_span((korean or {}).get(en), words, st - 4, et + 4) if words else None
+        guess = (st + span[0] + 0.5) / 2 if span and span[0] is not None else st
+        c = qon[np.abs(qon - guess) <= 1.0] if len(qon) else qon
+        s2 = float(c[np.argmin(np.abs(c - guess))]) if len(c) else snapped.get(en, (st,))[0]
+        nxt = min([l[0] for l in lines if l[0] > st + 0.3] or [len(x) / 16000])
+        heard = [w for w in (words or []) if s2 - 0.1 <= w[1] < nxt - 0.1]
+        if span and span[1] is not None and span[1] > s2 + 0.3:
+            e2 = span[1]
+        elif WORD_GAP_ENDS and heard and heard[-1][2] > s2 + 0.3:
+            e2 = heard[-1][2]                              # the line's words were not recognised, but their times were
+        else:
+            # free: Silero's speech stop nearest Gemini's end, 0.1 s earlier (Silero stops a little late); tested
+            # 2026-10-17 on 70 line ends both recognisers agreed on: 66% within 0.2 s, 81% within 0.5 s
+            c = offs[(np.abs(offs - et) <= 1.0) & (offs > s2 + 0.3)] if len(offs) else offs
+            if not len(c) and len(offs):
+                # no stop near Gemini's end (it can be seconds late): the stop nearest where a line this long ends
+                # at the measured pace (0.169 s a Korean syllable), between the start and Gemini's end
+                n = len(HANGUL.findall((korean or {}).get(en) or ''))
+                if n >= 4:
+                    est = s2 + n * SYLLABLE_S
+                    c = offs[(offs > s2 + 0.3) & (offs <= et + 1.0) & (np.abs(offs - est) <= 1.5)]
+                    et = est
+            e2 = (float(c[np.argmin(np.abs(c - et))]) if len(c) else et) - END_TRIM_S
+        out.append([s2, max(e2, s2 + 0.5), en])
+    out.sort(key=lambda l: l[0])
+    for i in range(len(out) - 1):                         # a line never runs on past the start of the next
+        if not out[i][2].startswith('♪') and out[i][1] > out[i + 1][0] - 0.05:
+            out[i][1] = max(out[i][0] + 0.5, out[i + 1][0] - 0.05)
+    return [tuple(l) for l in out]
+   # starts: Gemini's own (user, 2026-10-17, and the A/B test below); ends: snapped to the voice.
                      # Whole-chunk shifts, re-asking a badly timed chunk and dropping lines over silence stay.
 
 
-def snap_to_speech(lines, x):
-    """Gemini's times are rough (~0.5 s). Move each line's start to where speech actually starts nearby (and its end to
-    where it stops), from the sound itself: phrase-level activity = frames well above the noise floor, smoothed over
-    0.2 s. Lines with no clear edge nearby keep Gemini's time. Times are seconds into x (16 kHz).
-    First, a line over (near) silence is dropped: Gemini sometimes invents one there ("This is Korean Central
-    Television" over 3 s of silence)."""
+def snap_to_speech(lines, x, words=None, korean=None):
+    """The timing of a chunk's lines (seconds into x, 16 kHz): see timed_lines. words: Speech-to-Text words for x (or
+    None), korean: English line -> its Korean (Gemini.korean). First, a line over (near) silence is dropped: Gemini
+    sometimes invents one there ("This is Korean Central Television" over 3 s of silence)."""
     if not lines or len(x) < 16000:
         return lines
     lines = [l for l in lines if voiced_seconds(x, l[0] - 0.3, l[1] + 0.3) >= 0.08]
     if not lines:
         return lines
-    if not SNAP_LINES:
-        # Measured 2026-10-17 against Speech-to-Text and Whisper word times (84 lines, 6 windows): Gemini's own start
-        # is the best start we have for free (the whole-chunk shift made 31 of 84 later and worse); the best free end
-        # is where the Silero speech detector says the speech stops (73-78% within 0.5 s, vs 57% Gemini, 57-61% by
-        # sound level). Without Silero, Gemini's end.
-        offs = speech_ends(x)
-        out = []
-        for st, et, en in lines:
-            if not en.startswith('♪') and len(offs):
-                c = offs[(np.abs(offs - et) <= 1.0) & (offs > st + 0.3)]
-                if len(c):
-                    et = float(c[np.argmin(np.abs(c - et))])
-            out.append((st, max(et, st + 0.5), en))
-        return out
+    if words is not None or not SNAP_LINES:
+        return timed_lines(lines, x, words, korean)
+    return snap_to_speech_plain(lines, x)
+
+
+def snap_to_speech_plain(lines, x):
+    """The ordinary snap: each line's start to the nearest onset of sound (refined to 10 ms), its end to where the
+    sound stops. The fallback start in timed_lines when no pause is near."""
+    if not lines or len(x) < 16000:
+        return lines
     hop = 320                                                  # 20 ms
     n = len(x) // hop
     fr = x[:n * hop].reshape(n, hop).astype(np.float32)
@@ -1493,7 +1607,7 @@ def snap_to_speech(lines, x):
     # shift (up to +-2.5 s) that puts the most line starts on speech onsets; use it only when clearly better and
     # at least 3 lines agree. Songs are left alone: singing over music has no clean onsets.
     spoken = [l for l in lines if not l[2].startswith('♪')]
-    if len(spoken) >= 3 and len(on):
+    if CHUNK_SHIFT and len(spoken) >= 3 and len(on):
         def score(d):
             return sum(max(0.0, 1 - float(np.min(np.abs(on - (st + d)))) / 0.4) for st, et, en in spoken)
         shifts = np.arange(-2.5, 2.51, 0.1)
@@ -1509,7 +1623,7 @@ def snap_to_speech(lines, x):
         # a line Gemini starts on silence: the words come with the first onset after it (2026-10-16: 7% of
         # sentence starts sat 0.6-1 s ahead of the voice, beyond the reach above). Silence here also means a music
         # bed with no voice on it: clearly (8 dB+) quieter than the first 0.4 s after the onset.
-        c = on[(on > st) & (on <= min(st + 1.5, et - 0.5))] if not en.startswith('♪') else []
+        c = on[(on > st) & (on <= min(st + 1.5, et - 0.5))] if FORWARD_SILENT and not en.startswith('♪') else []
         if len(c):
             i0, i1 = max(0, int(st / 0.02)), int(c[0] / 0.02)
             if voiced_seconds(x, st, st + 0.3) < 0.1 or (i1 - i0 >= 3 and db[i1:i1 + 20].mean() - db[i0:i1].mean() >= 8):
@@ -1750,7 +1864,11 @@ class Channel(threading.Thread):
                     lines = well_aligned(self.gemini, flac, audio, secs, deadline, expect, lines)   # badly timed: ask again
                     lines = fill_gaps(self.gemini, flac, audio, secs, deadline, expect, lines)      # speech left out
                     lines = fix_foreign(self.gemini.key, lines)                                     # garbled script
-                cues = make_cues(snap_to_speech(lines, audio), voice_starts(audio)) if lines else []   # timed once, here
+                if lines:                                   # timed once, here (Speech-to-Text words when configured)
+                    words = stt_words(STT_KEY, audio) if STT_KEY else None
+                    cues = make_cues(snap_to_speech(lines, audio, words, self.gemini.korean if self.gemini else None), voice_starts(audio))
+                else:
+                    cues = []
                 if cues and self.gemini and time.time() < deadline - 20:
                     cues = condense_cues(self.gemini.key, cues)                         # too dense to read: shorten
                 return (None if lines is None else cues), time.time() - t0
@@ -2196,6 +2314,7 @@ if __name__ == '__main__':
             chans_cfg = [dict(chans_cfg[0], dir=c.split('=', 1)[1])]
     r2, groq = R2(ENV), Groq(key)
     gemini = Gemini(config_key(conf))
+    # Speech-to-Text is not used (user, 2026-10-17: too expensive); stt_words stays for a test or a one-off
     chans = [Channel(c, r2, groq, gemini) for c in chans_cfg]
     for c in chans:
         c.start()
