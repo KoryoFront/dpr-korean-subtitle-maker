@@ -1037,8 +1037,9 @@ def split_cues(text):
     return out
 
 
-LINGER_S = 1.0                                      # a subtitle stays at most this long after its words end
-LATE_S = 0.2                                  # most a subtitle may start after its voice (see polish)
+LINGER_S = 0.4                                      # a subtitle stays at most this long after its words end
+LATE_S = 0.1                                  # most a subtitle may start after its voice (see polish)
+LEAD_S = 0.0                                  # a subtitle never shows before its voice (user: 'start early')
 
 
 def make_cues(lines, onsets=None):
@@ -1075,7 +1076,7 @@ def make_cues(lines, onsets=None):
         c[1] = max(c[1], min(c[0] + want, nxt - 0.08))                     # long enough to read, if there is room
         c[1] = min(c[1], c[0] + 7.0, nxt - 0.08 if i + 1 < len(cues) else c[1])
         dense = len(c[2]) / max(0.1, c[4] - c[0]) > 20                      # a lot to read: may stay a little longer
-        c[1] = min(c[1], max(c[4] + (1.8 if dense else LINGER_S), c[0] + 1.0))  # never long after the voice stops
+        c[1] = min(c[1], max(c[4] + (2 * LINGER_S if dense else LINGER_S), c[0] + 0.83))  # never long after the voice
         c[1] = max(c[1], c[0] + 0.83)                                       # broadcast minimum: 5/6 of a second
     cues = polish(cues)
     return [(c[0], c[1], song_marks(split_two(c[2]) or [c[2]]) if c[3] else '\n'.join(split_two(c[2]) or [c[2]])) for c in cues]
@@ -1107,7 +1108,7 @@ def polish(cues):
         if need <= 0 or len(c[2]) / max(0.1, c[1] - c[0]) <= 20:
             continue
         free_before = c[0] - (out[i - 1][1] + 0.08 if i else 0)
-        lead = max(0.0, min(0.3, free_before, need))
+        lead = max(0.0, min(LEAD_S, free_before, need))
         c[0] -= lead; need -= lead
         if need > 0 and i + 1 < len(out):
             n = out[i + 1]
@@ -1124,7 +1125,7 @@ def polish(cues):
         need = 0.83 - (c[1] - c[0])
         if need <= 0:
             continue
-        lead = max(0.0, min(need, 0.4, c[0] - (out[i - 1][1] + 0.08 if i else 0)))
+        lead = max(0.0, min(need, 2 * LEAD_S, c[0] - (out[i - 1][1] + 0.08 if i else 0)))
         c[0] -= lead; need -= lead
         if need > 0 and i:
             p = out[i - 1]
@@ -1187,6 +1188,37 @@ def speech_onsets(x):
     act = db > np.percentile(db, 20) + 10
     act = np.convolve(act.astype(np.int32), np.ones(10, dtype=np.int32), 'same') > 5
     return (np.where(~act[:-1] & act[1:])[0] + 1) * 0.02
+
+
+def audio_timeline(path):
+    """(decoded, timeline) for a recording's first audio track: where each decoded frame's sound starts in the sample
+    stream ffmpeg -f s16le gives (frames end to end) and where it plays (its own timestamp, from the track's start).
+    They differ: KCTV's audio clock runs ~17 ppm fast against its timestamps, so decoded time gains 0.06 s an hour
+    (0.68 s late after 13 h, 2026-10-16), and a damaged frame decodes to nothing (5 that day, 24 ms each). Read from
+    the decoded frames themselves (framecrc), so lost frames count too. to_timeline maps."""
+    p = subprocess.Popen(['nice', '-n', '19', 'ffmpeg', '-nostdin', '-v', 'quiet', '-i', path, '-map', '0:a:0',
+                          '-c:a', 'pcm_s16le', '-f', 'framecrc', '-'], stdout=subprocess.PIPE, text=True)
+    sr, pts, n = 48000, [], []
+    for line in p.stdout:
+        if line.startswith('#'):
+            if line.startswith('#tb 0:'):
+                sr = int(line.split('/')[-1])                 # time base 1/sample rate: pts and duration in samples
+            continue
+        f = line.split(',')
+        if len(f) >= 4:
+            pts.append(int(f[2])); n.append(int(f[3]))
+    p.wait()
+    if len(pts) < 2:
+        return None
+    pts, n = np.array(pts, dtype=np.float64), np.array(n, dtype=np.float64)
+    return np.concatenate([[0.0], np.cumsum(n)[:-1]]) / sr, (pts - pts[0]) / sr
+
+
+def to_timeline(t, tl):
+    """Decoded-audio seconds -> seconds on the recording's own clock (see audio_timeline). tl None: unchanged."""
+    if tl is None:
+        return t
+    return np.interp(t, tl[0], tl[1]) if np.ndim(t) else float(np.interp(t, tl[0], tl[1]))
 
 
 def pause_ends(x, depth=9.0):
@@ -1271,6 +1303,8 @@ def snap_to_speech(lines, x):
     act = np.convolve(act.astype(np.int32), np.ones(10, dtype=np.int32), 'same') > 5
     on = (np.where(~act[:-1] & act[1:])[0] + 1) * 0.02
     off = (np.where(act[:-1] & ~act[1:])[0] + 1) * 0.02
+    m = len(x) // 160                                          # 10 ms frames for the fine edges
+    fdb = 20 * np.log10(np.sqrt((x[:m * 160].reshape(m, 160).astype(np.float32) ** 2).mean(axis=1)) + 1e-9)
     # Gemini sometimes misplaces a whole chunk by 1-2 s (2026-10-16 12:29-12:31: every line late). Find the one
     # shift (up to +-2.5 s) that puts the most line starts on speech onsets; use it only when clearly better and
     # at least 3 lines agree. Songs are left alone: singing over music has no clean onsets.
@@ -1298,8 +1332,42 @@ def snap_to_speech(lines, x):
                 st2 = float(c[0])
         c = off[(off >= et - 0.6) & (off <= et + 1.0) & (off > st2 + 0.6)]
         et2 = float(c[np.argmin(np.abs(c - et))]) if len(c) else et
+        if not en.startswith('♪'):
+            st2, et2 = fine_edges(fdb, st2, et2)
         out.append((st2, max(et2, st2 + 0.8), en))
     return out
+
+
+def fine_edges(fdb, st, et):
+    """The phrase-level edges above are 20 ms frames smoothed over 0.2 s: a soft first syllable is missed (the line
+    shows ~0.1-0.3 s late) and the end lands on the smoothed tail. Refine both on 10 ms frames: voice = 8 dB above
+    the local floor (25th percentile of the 6 s around). A start inside voice walks back to where it began (at most
+    0.25 s, so it never reaches into the sentence before); a start on silence walks on to the first voice (0.6 s).
+    The end goes back to the last voiced 10 ms (at most 1 s), or on while the voice lasts (0.4 s)."""
+    n = len(fdb)
+    if not 0 <= int(st * 100) < n or int(et * 100) <= 0:
+        return st, et                                    # outside this audio (a line timed past the chunk's end)
+    def voiced(k, fl):
+        return 0 <= k < n and fdb[k] > fl + 8
+    k = int(st * 100)
+    fl = np.percentile(fdb[max(0, k - 300):k + 300], 25)
+    if voiced(k, fl):
+        j = k
+        while j > k - 25 and voiced(j - 1, fl): j -= 1
+    else:
+        j = k
+        while j < k + 60 and j < n and not voiced(j, fl): j += 1
+        if j >= k + 60 or j >= n: j = k
+    st2 = j / 100
+    k = min(int(et * 100), n)
+    fl = np.percentile(fdb[max(0, k - 300):k + 300], 25)
+    if not voiced(k - 1, fl):
+        j = k
+        while j > max(k - 100, int(st2 * 100) + 50) and not voiced(j - 1, fl): j -= 1
+    else:
+        j = k
+        while j < k + 40 and voiced(j, fl): j += 1
+    return st2, max(j / 100, st2 + 0.5)
 
 
 def tidy_lines(lines):

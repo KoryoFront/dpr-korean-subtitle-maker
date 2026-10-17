@@ -630,8 +630,11 @@ def main():
             if r: lines += r
             else: say('  chunk %d has no subtitles (Gemini kept failing)' % j[0])
         if LIVE:                                              # exactly the live engine's rules, then broadcast shortening
-            cues = LIVE.make_cues([(s + a_off, e + a_off, LIVE.dprk_english(t)) for s, e, t in lines],
-                                  np.sort(np.concatenate(starts)) + a_off if starts else None)
+            say('reading the sound timestamps ...')
+            tl = LIVE.audio_timeline(cut)                  # decoded time drifts from the recording's clock (~0.06 s/h)
+            T = lambda v: LIVE.to_timeline(v, tl) + a_off
+            cues = LIVE.make_cues([(T(s), T(e), LIVE.dprk_english(t)) for s, e, t in lines],
+                                  T(np.sort(np.concatenate(starts))) if starts else None)
             say('shortening subtitles too dense to read ...')
             cues = LIVE.condense_cues(key, cues)
             bold = LIVE.bold_leaders
