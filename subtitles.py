@@ -1448,7 +1448,8 @@ def speech_ends(x):
     if _vad is None or len(x) < 16000:
         return np.array([])
     try:
-        ts = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0))
+        ts = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=VAD_SILENCE_MS, speech_pad_ms=0,
+                                                              threshold=VAD_THRESHOLD))
     except Exception:
         return np.array([])
     return np.array([t['end'] / 16000 for t in ts])
@@ -1456,6 +1457,7 @@ def speech_ends(x):
 
 CHUNK_SHIFT = False       # whole-chunk shift: measured worse (31 of 84 lines moved the wrong way), off
 FORWARD_SILENT = True     # a line starting on quiet moves to the next onset
+VAD_SILENCE_MS, VAD_THRESHOLD = 150, 0.65               # Silero settings for speech_ends (0.65: better ends on both test sets)
 SNAP_LINES = False
 HANGUL = re.compile(r'[가-힣0-9]')
 STT_KEY = None                                          # set from the config (stt_key) by main()
