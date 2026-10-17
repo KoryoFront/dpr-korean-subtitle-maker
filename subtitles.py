@@ -310,6 +310,8 @@ def is_song(kind, ko, en):
         return False
     # narration over music reports facts: a year or a large figure is never sung (2026-10-16 2:45: "visited
     # educators' apartments three times in 2013 alone" came out as a lyric)
+    if re.search(r'\d{1,2}:\d\d|\d+\s*시\s*\d*\s*분?|\d+\s*월\s*\d+\s*일', en + ' ' + ko):
+        return False                     # a clock time or a date is announced, never sung (the day's schedule over music)
     return not re.search(r'\b(1[89]|20)\d\d\b|\d{3,}|\d+(\.\d+)?\s*(per ?cent|%|tons?|metres|hectares|chongbo)', en)
 
 
@@ -1460,6 +1462,9 @@ STT_KEY = None                                          # set from the config (s
 EXTEND_ENDS = False                                     # (Speech-to-Text only) tested: no better
 WORD_GAP_ENDS = False                                   # (Speech-to-Text only) tested: worse
 END_TRIM_S = 0.1                                        # Silero stops a little late
+START_GUARD = False                                     # tested: the guard blocked most of the gain
+START_BEFORE_S, START_AFTER_S = 0.8, 2.0                # pause onset search around Gemini's start (tested)
+END_FALLBACK = 'last'                                   # see timed_lines
 SYLLABLE_S = 0.169                                      # measured KCTV pace: seconds per Korean syllable
 
 
@@ -1543,7 +1548,10 @@ def timed_lines(lines, x, words=None, korean=None):
             out.append((st, et, en)); continue
         span = word_span((korean or {}).get(en), words, st - 4, et + 4) if words else None
         guess = (st + span[0] + 0.5) / 2 if span and span[0] is not None else st
-        c = qon[np.abs(qon - guess) <= 1.0] if len(qon) else qon
+        # Gemini starts lines early (median 0.3 s, often 1-2 s): look further after its start than before, but only
+        # when its start falls on quiet; inside ongoing speech a pause 2 s on would belong to a later clause
+        after = START_AFTER_S if (not START_GUARD or voiced_seconds(x, guess, guess + 0.3) < 0.1) else 1.0
+        c = qon[(qon >= guess - START_BEFORE_S) & (qon <= guess + after)] if len(qon) else qon
         s2 = float(c[np.argmin(np.abs(c - guess))]) if len(c) else snapped.get(en, (st,))[0]
         nxt = min([l[0] for l in lines if l[0] > st + 0.3] or [len(x) / 16000])
         heard = [w for w in (words or []) if s2 - 0.1 <= w[1] < nxt - 0.1]
@@ -1555,7 +1563,11 @@ def timed_lines(lines, x, words=None, korean=None):
             # free: Silero's speech stop nearest Gemini's end, 0.1 s earlier (Silero stops a little late); tested
             # 2026-10-17 on 70 line ends both recognisers agreed on: 66% within 0.2 s, 81% within 0.5 s
             c = offs[(np.abs(offs - et) <= 1.0) & (offs > s2 + 0.3)] if len(offs) else offs
-            if not len(c) and len(offs):
+            if not len(c) and len(offs) and END_FALLBACK == 'last':
+                # no stop near Gemini's end (it can be seconds late): the last stop before it
+                c = offs[(offs > s2 + 0.3) & (offs <= et + 0.3)]
+                c = c[-1:] if len(c) else c
+            elif not len(c) and len(offs):
                 # no stop near Gemini's end (it can be seconds late): the stop nearest where a line this long ends
                 # at the measured pace (0.169 s a Korean syllable), between the start and Gemini's end
                 n = len(HANGUL.findall((korean or {}).get(en) or ''))
