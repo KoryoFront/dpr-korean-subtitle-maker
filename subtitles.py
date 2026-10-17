@@ -44,6 +44,27 @@ DRY = '--dry' in sys.argv                                          # write files
 # music (no invented lines) and caught speech Whisper replaced with a fake credit. Backup when Gemini is busy or
 # rate-limited: Groq Whisper large-v3 + a Groq text model (also free tier, ~8 h of audio a day).
 GEMINI_MODEL = 'gemini-flash-lite-latest'
+VERTEX_MODELS = {'gemini-flash-lite-latest': 'gemini-3.5-flash-lite'}   # Vertex has no "-latest" alias
+
+
+def gemini_request(key, model, body):
+    """One Gemini call, by whichever service the key belongs to: a Vertex AI key (starts "AQ.", billed to the Google
+    Cloud project, so Cloud credits apply) goes to Vertex, an AI Studio key to the Gemini API. Same model, same request
+    (Vertex wants every message to name its role, so a missing one is set to "user")."""
+    if str(key).startswith('AQ.'):
+        b = json.loads(body)
+        for c in b.get('contents', []):
+            c.setdefault('role', 'user')
+        url = 'https://aiplatform.googleapis.com/v1/publishers/google/models/%s:generateContent' % VERTEX_MODELS.get(model, model)
+        body = json.dumps(b).encode()
+    else:
+        url = 'https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % model
+    return urllib.request.Request(url, data=body, headers={'x-goog-api-key': key, 'Content-Type': 'application/json'})
+
+
+def config_key(conf):
+    """The Gemini key to use: the Vertex AI key when there is one (user, 2026-10-17), else the AI Studio key."""
+    return conf.get('vertex_key') or conf.get('gemini_key')
 PRICE_IN, PRICE_OUT = 0.30, 2.50                                   # USD per million tokens, Gemini 3.5 Flash-Lite (what 'latest' is now), audio in at the same rate
 USAGE_FILE = os.path.join(os.environ.get('SUBS_STATE', '/DATA/subs'), 'usage.json')
 GEMINI_BACKUP = None                                               # the user wants one model only: busy -> retry the same one
@@ -275,13 +296,21 @@ DPRK_STYLE = (
 SPOKEN_ENDING = re.compile(r'(니다|니까|십시오|십시요|세요|ㅂ시다|읍시다|습니까|겠습니다)[\s.?!…"\'」』)]*$')
 
 
+NARRATED_ENDING = re.compile(r'(었다|았다|였다|했다|되었다|하였다|있었다|입니다)[\s.?!…"\'」』)]*$')   # narrative past tense
+
+
 def is_song(kind, ko, en):
     """Stricter than Gemini's label: songs get no subtitles, so a spoken line must never be taken for one.
     Narration, news and commentary end in formal endings (-습니다/-ㅂ니다); lyrics almost never do. A long line
     is narration too."""
     if not str(kind or '').lower().startswith('song'):
         return False
-    return not SPOKEN_ENDING.search(str(ko or '').strip()) and len(en) <= 92
+    ko, en = str(ko or '').strip(), str(en or '')
+    if SPOKEN_ENDING.search(ko) or NARRATED_ENDING.search(ko) or len(en) > 92:
+        return False
+    # narration over music reports facts: a year or a large figure is never sung (2026-10-16 2:45: "visited
+    # educators' apartments three times in 2013 alone" came out as a lyric)
+    return not re.search(r'\b(1[89]|20)\d\d\b|\d{3,}|\d+(\.\d+)?\s*(per ?cent|%|tons?|metres|hectares|chongbo)', en)
 
 
 # South Korean spellings that slip into translations, and their DPRK forms
@@ -341,9 +370,12 @@ GEMINI_PROMPT = (
     "breaks, each with its own times. "
     "Keep each stretch to one sentence or clause (at most about 7 seconds). Mark kind as 'song' ONLY when the words "
     "are actually SUNG to a melody (a song, a choir, sung lyrics); everything spoken is 'speech' — including narration, "
-    "a presenter, poetry recitation or dialogue with music playing underneath. When unsure, use 'speech'. "
+    "a presenter, poetry recitation or dialogue with music playing underneath, even when singing or a choir can be heard "
+    "behind the voice: what is SPOKEN is speech. A line that reports facts (who did what, when, dates, numbers) is speech. "
+    "When unsure, use 'speech'. "
     "SONGS: give one stretch per sung lyric line (usually 3-7 seconds), starting exactly when that line starts to be "
-    "sung, never two lines merged into one, and include every line of every verse and refrain. " + DPRK_STYLE)
+    "sung and ending when its last note ends (a long held note included), never two lines merged into one; the times "
+    "follow the singing, never spread evenly. Include every line of every verse and refrain, also when it repeats. " + DPRK_STYLE)
 GEMINI_SCHEMA = {"type": "OBJECT", "properties": {"segments": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
     "start": {"type": "NUMBER"}, "end": {"type": "NUMBER"}, "kind": {"type": "STRING"}, "lang": {"type": "STRING"}, "ko": {"type": "STRING"}, "en": {"type": "STRING"}},
     "required": ["start", "end", "kind", "ko", "en"]}}}, "required": ["segments"]}
@@ -411,14 +443,13 @@ class Gemini:
                   "description": "Look up a Korean word (DPRK spelling) in the DPRK Samhung Korean-English dictionary. Returns matching headwords with their English meanings and, for loanwords, the foreign original.",
                   "parameters": {"type": "OBJECT", "properties": {"word": {"type": "STRING", "description": "one Korean word, without particles if possible"}}, "required": ["word"]}}]}]
         contents = [{"role": "user", "parts": [{"text": prompt}]}]
-        url = 'https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % GEMINI_MODEL
         try:
             for round_ in range(8):
                 left = deadline - time.time()
                 if left < 6:
                     return
                 body = json.dumps({"contents": contents, "tools": tools, "generationConfig": {"temperature": 0}}).encode()
-                req = urllib.request.Request(url, data=body, headers={'x-goog-api-key': self.key, 'Content-Type': 'application/json'})
+                req = gemini_request(self.key, GEMINI_MODEL, body)
                 try:
                     r = json.load(urllib.request.urlopen(req, timeout=max(5, min(request_s, left - 2))))
                 except urllib.error.HTTPError as e:
@@ -472,8 +503,7 @@ class Gemini:
                            "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
                                                 "responseSchema": {"type": "OBJECT", "properties": {"lines": {"type": "ARRAY", "items": {"type": "STRING"}}},
                                                                    "required": ["lines"]}}}).encode()
-        req = urllib.request.Request('https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % GEMINI_MODEL, data=body,
-                                     headers={'x-goog-api-key': self.key, 'Content-Type': 'application/json'})
+        req = gemini_request(self.key, GEMINI_MODEL, body)
         try:
             r = json.load(urllib.request.urlopen(req, timeout=max(3, min(15, (deadline or time.time() + 15) - time.time()))))
             self.count(r.get('usageMetadata') or {})
@@ -502,8 +532,7 @@ class Gemini:
         while time.time() < deadline - 3:
             attempt += 1
             model = GEMINI_MODEL
-            req = urllib.request.Request('https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % model, data=body,
-                                         headers={'x-goog-api-key': self.key, 'Content-Type': 'application/json'})
+            req = gemini_request(self.key, model, body)
             try:
                 r = json.load(urllib.request.urlopen(req, timeout=max(5, min(REQUEST_TIMEOUT, deadline - time.time()))))
                 self.count(r.get('usageMetadata') or {})
@@ -552,10 +581,9 @@ def gemini_json(key, parts, schema=None, timeout=120, tries=8):
     if schema:
         cfg["responseSchema"] = schema
     body = json.dumps({"contents": [{"parts": parts}], "generationConfig": cfg}).encode()
-    url = 'https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % GEMINI_MODEL
     for attempt in range(tries):
         try:
-            r = json.load(urllib.request.urlopen(urllib.request.Request(url, data=body, headers={'x-goog-api-key': key, 'Content-Type': 'application/json'}), timeout=timeout))
+            r = json.load(urllib.request.urlopen(gemini_request(key, GEMINI_MODEL, body), timeout=timeout))
             return json.loads(r['candidates'][0]['content']['parts'][0]['text'])
         except urllib.error.HTTPError as e:
             if e.code in (400, 401, 402, 403):
@@ -984,6 +1012,37 @@ def clean_text(t):
     return t[:1].upper() + t[1:] if t else t
 
 
+ABBREV = {'Mt.', 'St.', 'Dr.', 'Mr.', 'Mrs.', 'Ms.', 'No.', 'Prof.', 'Gen.', 'Col.', 'Lt.', 'Capt.'}
+
+
+def in_leader(words, i):
+    """True if a break before words[i] would cut a leader's name (Kim Il Sung, Kim Jong Il, Kim Jong Un, Kim Jong
+    Suk): never allowed."""
+    if i <= 0 or i >= len(words):
+        return False
+    left = ' '.join(words[max(0, i - 3):i])
+    for m in LEADERS.finditer(' '.join(words[max(0, i - 3):i + 3])):
+        if m.start() < len(left) < m.end():
+            return True
+    return False
+
+
+def in_name(words, i):
+    """True if a break before words[i] would cut a name in two (user: names are never split over lines or
+    subtitles): both sides capitalised and nothing that ends a phrase in between ("Kim | Jong Un", "Ri Il | Hwan",
+    "Mt. | Paektu", "Sinhung | County"). A leader's name is caught whatever the case of its parts."""
+    if i <= 0 or i >= len(words):
+        return False
+    a, b = words[i - 1], words[i].lstrip('"“‘(')
+    if in_leader(words, i):
+        return True
+    if a in ABBREV:
+        return b[:1].isupper()
+    if a.endswith((',', ';', ':', '.', '?', '!', '"', '”', ')')) or a in ('I', 'A'):
+        return False
+    return a[:1].isupper() and b[:1].isupper() and a[:1].isalpha() and b[:1].isalpha()
+
+
 def split_two(text):
     """One subtitle's text as 1 or 2 balanced lines of at most LINE characters (None if it does not fit)."""
     if len(text) <= LINE:
@@ -991,9 +1050,9 @@ def split_two(text):
     words, best = text.split(' '), None
     for i in range(1, len(words)):
         a, b = ' '.join(words[:i]), ' '.join(words[i:])
-        if len(a) > LINE or len(b) > LINE:
+        if len(a) > LINE or len(b) > LINE or in_leader(words, i):
             continue
-        score = abs(len(a) - len(b))
+        score = abs(len(a) - len(b)) + (1000 if in_name(words, i) else 0)   # inside a name: only if nothing else fits
         last = words[i - 1].lower().strip(',;:')
         if words[i - 1].endswith((',', ';', ':')): score -= 14            # break after a comma
         if words[i].lower() in BREAK_BEFORE: score -= 8                     # break before a conjunction
@@ -1019,6 +1078,14 @@ def split_cues(text):
             for k in range(len(cur) - 1, max(0, len(cur) - 6), -1):
                 if cur[k - 1].endswith((',', ';', ':')) or cur[k].lower() in BREAK_BEFORE:
                     if len(' '.join(cur[:k])) >= 30: cut = k; break
+            full = cur + [w]
+            k = cut                                        # not between two parts of a name: the name moves on
+            while k > 1 and k > cut - 5 and in_name(full, k):
+                k -= 1
+            if not in_name(full, k) and len(' '.join(cur[:k])) >= 12:
+                cut = k
+            while cut > 1 and in_leader(full, cut):        # a leader's name is never cut, whatever it costs
+                cut -= 1
             out.append(' '.join(cur[:cut])); cur = cur[cut:] + [w]
         else:
             cur.append(w)
@@ -1029,7 +1096,7 @@ def split_cues(text):
         best = None
         for i in range(1, len(both)):
             a, b = ' '.join(both[:i]), ' '.join(both[i:])
-            if split_two(a) and split_two(b):
+            if not in_name(both, i) and split_two(a) and split_two(b):
                 score = abs(len(a) - len(b)) - (12 if both[i - 1].endswith((',', ';', ':')) else 0)
                 if best is None or score < best[0]:
                     best = (score, a, b)
@@ -1055,6 +1122,8 @@ def make_cues(lines, onsets=None):
         # capital only at the start of the sentence; a continuation keeps its lower case
         # a sentence split over several subtitles: the middle parts keep a natural comma, no dash or semicolon
         parts = [re.sub(r'[\s;:\-–—]+$', '', p).strip() for p in split_cues(clean_text(en) if not song else clean_text(en).rstrip('.'))]
+        if song:                                             # lyrics: one line per subtitle, shown as it is sung
+            parts = [r for p in parts for r in (split_two(p) or [p])]
         parts = [p for p in parts if re.search(r'[A-Za-z0-9]', p)]
         if not parts:
             continue
@@ -1075,9 +1144,16 @@ def make_cues(lines, onsets=None):
         nxt = cues[i + 1][0] if i + 1 < len(cues) else c[0] + 7.0
         want = max(1.0, len(c[2]) / 17.0)
         c[1] = max(c[1], min(c[0] + want, nxt - 0.08))                     # long enough to read, if there is room
+        if c[3]:
+            # a sung line stays up through its held notes: until the next lyric (if it follows within 3 s; user,
+            # 2026-10-17: "lines end early due to long held notes"), at most 7 s
+            if i + 1 < len(cues) and cues[i + 1][3] and nxt - c[1] < 3.0:
+                c[1] = nxt - 0.08
+            c[1] = min(c[1], c[0] + 7.0, nxt - 0.08 if i + 1 < len(cues) else c[1])
+            c[1] = max(c[1], c[0] + 0.83)
+            continue
         c[1] = min(c[1], c[0] + 7.0, nxt - 0.08 if i + 1 < len(cues) else c[1])
-        dense = len(c[2]) / max(0.1, c[4] - c[0]) > 20                      # a lot to read: may stay a little longer
-        c[1] = min(c[1], max(c[4] + (2 * LINGER_S if dense else LINGER_S), c[0] + 0.83))  # never long after the voice
+        c[1] = min(c[1], max(c[4] + LINGER_S, c[0] + 0.83))   # ends with the words (+0.4 s); too dense -> condensed
         c[1] = max(c[1], c[0] + 0.83)                                       # broadcast minimum: 5/6 of a second
     cues = polish(cues)
     return [(c[0], c[1], song_marks(split_two(c[2]) or [c[2]]) if c[3] else '\n'.join(split_two(c[2]) or [c[2]])) for c in cues]
@@ -1191,35 +1267,7 @@ def speech_onsets(x):
     return (np.where(~act[:-1] & act[1:])[0] + 1) * 0.02
 
 
-def audio_timeline(path):
-    """(decoded, timeline) for a recording's first audio track: where each decoded frame's sound starts in the sample
-    stream ffmpeg -f s16le gives (frames end to end) and where it plays (its own timestamp, from the track's start).
-    They differ: KCTV's audio clock runs ~17 ppm fast against its timestamps, so decoded time gains 0.06 s an hour
-    (0.68 s late after 13 h, 2026-10-16), and a damaged frame decodes to nothing (5 that day, 24 ms each). Read from
-    the decoded frames themselves (framecrc), so lost frames count too. to_timeline maps."""
-    p = subprocess.Popen(['nice', '-n', '19', 'ffmpeg', '-nostdin', '-v', 'quiet', '-i', path, '-map', '0:a:0',
-                          '-c:a', 'pcm_s16le', '-f', 'framecrc', '-'], stdout=subprocess.PIPE, text=True)
-    sr, pts, n = 48000, [], []
-    for line in p.stdout:
-        if line.startswith('#'):
-            if line.startswith('#tb 0:'):
-                sr = int(line.split('/')[-1])                 # time base 1/sample rate: pts and duration in samples
-            continue
-        f = line.split(',')
-        if len(f) >= 4:
-            pts.append(int(f[2])); n.append(int(f[3]))
-    p.wait()
-    if len(pts) < 2:
-        return None
-    pts, n = np.array(pts, dtype=np.float64), np.array(n, dtype=np.float64)
-    return np.concatenate([[0.0], np.cumsum(n)[:-1]]) / sr, (pts - pts[0]) / sr
-
-
-def to_timeline(t, tl):
-    """Decoded-audio seconds -> seconds on the recording's own clock (see audio_timeline). tl None: unchanged."""
-    if tl is None:
-        return t
-    return np.interp(t, tl[0], tl[1]) if np.ndim(t) else float(np.interp(t, tl[0], tl[1]))
+LOCKED_16K = 'aresample=16000:async=1:min_hard_comp=0.02:first_pts=0'   # decode on the sound's own timestamps
 
 
 def pause_ends(x, depth=9.0):
@@ -1251,10 +1299,38 @@ def pause_ends(x, depth=9.0):
     return np.array(out)
 
 
+def vocal_starts(x, depth=8.0):
+    """Where a singer starts a phrase over music: the voice band's share of the sound (300-3400 Hz against the
+    rest) dips between sung phrases (a breath) and climbs back. Times in s into x (16 kHz)."""
+    hop = 320
+    n = len(x) // hop
+    if n < 40:
+        return np.array([])
+    fr = x[:n * hop].reshape(n, hop).astype(np.float32) * np.hanning(hop)
+    X = np.abs(np.fft.rfft(fr, axis=1)) ** 2
+    f = np.fft.rfftfreq(hop, 1 / 16000)
+    band, rest = (f > 300) & (f < 3400), (f < 250) | (f > 4000)
+    r = 10 * np.log10(X[:, band].sum(axis=1) + 1e-9) - 10 * np.log10(X[:, rest].sum(axis=1) + 1e-9)
+    r = np.convolve(r, np.ones(3) / 3, 'same')
+    out, i = [], 20
+    while i < n - 20:
+        if r[i] == r[i - 5:i + 6].min():
+            d = min(r[i - 20:i].max(), r[i:i + 20].max()) - r[i]
+            if d >= depth:
+                low, j = r[i] + d / 2, i
+                while j < n - 1 and r[j] < low:
+                    j += 1
+                out.append(j * 0.02)
+                i = j + 10
+                continue
+        i += 1
+    return np.array(out)
+
+
 def voice_starts(x):
     """Every place the voice starts or resumes in x: after silence (speech_onsets) or after a short pause (pause_ends).
     make_cues puts the break between two parts of a long line on one of these."""
-    return np.unique(np.round(np.concatenate([speech_onsets(x), pause_ends(x)]), 2))
+    return np.unique(np.round(np.concatenate([speech_onsets(x), pause_ends(x), vocal_starts(x)]), 2))
 
 
 def align_score(lines, x):
@@ -1351,6 +1427,10 @@ def fill_gaps(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
     return lines
 
 
+SNAP_LINES = False   # starts: Gemini's own (user, 2026-10-17, and the A/B test below); ends: snapped to the voice.
+                     # Whole-chunk shifts, re-asking a badly timed chunk and dropping lines over silence stay.
+
+
 def snap_to_speech(lines, x):
     """Gemini's times are rough (~0.5 s). Move each line's start to where speech actually starts nearby (and its end to
     where it stops), from the sound itself: phrase-level activity = frames well above the noise floor, smoothed over
@@ -1385,6 +1465,20 @@ def snap_to_speech(lines, x):
         d, base = float(shifts[k]), score(0.0)
         if abs(d) >= 0.4 and sc[k] >= base + 1.0 and sc[k] >= 1.3 * max(base, 0.5):
             lines = [(st + d, et + d, en) if not en.startswith('♪') else (st, et, en) for st, et, en in lines]
+    if not SNAP_LINES:
+        # A/B test against Speech-to-Text word times (2026-10-17, 42 lines): Gemini's own starts are closer (36% within
+        # 0.5 s vs 26% snapped), snapped ends are closer (62% vs 43%). So: Gemini's start, the end where the voice stops.
+        m = len(x) // 160
+        fdb = 20 * np.log10(np.sqrt((x[:m * 160].reshape(m, 160).astype(np.float32) ** 2).mean(axis=1)) + 1e-9)
+        out = []
+        for st, et, en in lines:
+            if not en.startswith('♪'):
+                c = off[(off >= et - 0.6) & (off <= et + 1.0) & (off > st + 0.6)]
+                if len(c):
+                    et = float(c[np.argmin(np.abs(c - et))])
+                et = fine_edges(fdb, st, et)[1]
+            out.append((st, max(et, st + 0.5), en))
+        return out
     out = []
     for st, et, en in lines:
         c = on[(on >= st - 1.0) & (on <= st + 0.6)]
@@ -1420,7 +1514,9 @@ def fine_edges(fdb, st, et):
     fl = np.percentile(fdb[max(0, k - 300):k + 300], 25)
     if voiced(k, fl):
         j = k
-        while j > k - 25 and voiced(j - 1, fl): j -= 1
+        while j > k - 26 and voiced(j - 1, fl): j -= 1
+        if j <= k - 26:
+            j = k                    # sound runs on further back (a music bed, the sentence before): not a voice start
     else:
         j = k
         while j < k + 60 and j < n and not voiced(j, fl): j += 1
@@ -1447,8 +1543,9 @@ def tidy_lines(lines):
     # A line that repeats the one just before it (a refrain heard twice in one answer) is dropped.
     kept = []
     for a, b, t in sorted(lines, key=lambda x: (x[0], x[1])):
-        if kept and a - kept[-1][1] < 8 and repeats(t.lstrip('♪ '), [kept[-1][2].lstrip('♪ ')], 0.85) and len(content_words(t)) >= 2:
-            continue
+        song = t.startswith('♪')
+        if kept and a - kept[-1][1] < (0.0 if song else 8) and repeats(t.lstrip('♪ '), [kept[-1][2].lstrip('♪ ')], 0.85) and len(content_words(t)) >= 2:
+            continue                                 # a song's refrain is sung again and shown again (2026-10-16 13:45)
         kept.append((a, b, t))
     lines = kept
     lines = sorted(lines, key=lambda x: (x[0], x[1]))
@@ -1630,7 +1727,7 @@ class Channel(threading.Thread):
                     lines = well_aligned(self.gemini, flac, audio, secs, deadline, expect, lines)   # badly timed: ask again
                     lines = fill_gaps(self.gemini, flac, audio, secs, deadline, expect, lines)      # speech left out
                     lines = fix_foreign(self.gemini.key, lines)                                     # garbled script
-                cues = make_cues(snap_to_speech(lines, audio), voice_starts(audio)) if lines else []
+                cues = make_cues(lines, voice_starts(audio)) if lines else []   # lines are snapped already: once only
                 if cues and self.gemini and time.time() < deadline - 20:
                     cues = condense_cues(self.gemini.key, cues)                         # too dense to read: shorten
                 return (None if lines is None else cues), time.time() - t0
@@ -2075,7 +2172,7 @@ if __name__ == '__main__':
         if c.startswith('--dir='):                              # testing: read a different folder
             chans_cfg = [dict(chans_cfg[0], dir=c.split('=', 1)[1])]
     r2, groq = R2(ENV), Groq(key)
-    gemini = Gemini(conf.get('gemini_key'))
+    gemini = Gemini(config_key(conf))
     chans = [Channel(c, r2, groq, gemini) for c in chans_cfg]
     for c in chans:
         c.start()

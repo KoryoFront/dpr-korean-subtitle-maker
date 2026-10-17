@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Checks a subtitle file against the house rules and lists everything that breaks them.
   python3 review_srt.py english.srt"""
-import re, sys, collections
+import os, re, sys, collections
+
+for d in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if os.path.exists(os.path.join(d, 'subtitles.py')):
+        sys.path.insert(0, d)
+        break
+from subtitles import in_name, LEADERS               # the same name rule the subtitles are made with
 
 SOUTH = r"\b(Baekdu|Joseon|Pyeongyang|Hamheung|Kaeseong|Gaeseong|Shinuiju|Sinuiju-si|Cheongjin|Jeongju|Kim Jong-un|Kim Il-sung|Kim Jong-il|Kim Yo-jong|Ri Il-hwan|Chosun|Daedong|Busan)\b"
 FILLER = r"(?<![\w'])(uh+|um+|er+m?|ern|ah+|eh+|hmm+)(?![\w'])"
@@ -36,6 +42,16 @@ def main(path):
         if re.search(r'North Korea', text): problems['"North Korea"'].append((i, text))
         if re.search(FILLER, text, re.I): problems['filler word'].append((i, text))
         if prev and text == prev[2]: problems['same as the one before'].append((i, text))
+        if len(rows) == 2:
+            w = rows[0].split() + rows[1].split()
+            w = [re.sub(r'</?b>', '', x) for x in w]
+            if in_name(w, len(rows[0].split())): problems['name split over two lines'].append((i, ' / '.join(plain)))
+        if prev and not song:
+            w = prev[2].split() + text.split()
+            if in_name(w, len(prev[2].split())): problems['name split over two subtitles'].append((i, prev[2][-30:] + ' | ' + text[:30]))
+        for m in LEADERS.finditer(text):
+            if '<b>%s</b>' % m.group(0) not in ' '.join(rows):
+                problems["leader's name not bold"].append((i, text))
         if re.search(r'[;:-]$', body[-1]): problems['line ends with ; : or -'].append((i, text))
         if words:
             odd = [w for w in re.findall(r"\b[a-z][a-z]+\b", text) if not any(x in words for x in (w, w[:-1], w[:-2], w[:-3]))]

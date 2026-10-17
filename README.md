@@ -16,7 +16,10 @@ For `recording.ts` it writes, next to it:
 
 - Python 3.8 or newer, with numpy: `pip install -r requirements.txt`
 - ffmpeg and ffprobe on the PATH: https://ffmpeg.org/download.html
-- A Google AI Studio (Gemini) API key with billing (prepaid credit) enabled: https://aistudio.google.com
+- A Gemini API key, either:
+  - Google AI Studio, with billing (prepaid credit) enabled: https://aistudio.google.com
+  - or a Vertex AI API key (starts `AQ.`) from a Google Cloud project with billing enabled, so Google Cloud credits
+    apply: https://cloud.google.com/vertex-ai/generative-ai/docs/start/api-keys
   A full KCTV day (about 14 hours on air) costs roughly 2-3 US dollars.
 
 ## Run

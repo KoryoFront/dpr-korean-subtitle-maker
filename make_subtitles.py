@@ -23,6 +23,21 @@ except ImportError:
     sys.exit('numpy is missing: run  pip install numpy  and start again.')
 
 MODEL = 'gemini-flash-lite-latest'     # fast and cheap; quality was as good as Whisper large-v3 in tests
+VERTEX_MODELS = {'gemini-flash-lite-latest': 'gemini-3.5-flash-lite'}   # Vertex has no "-latest" alias
+
+
+def gemini_request(key, model, body):
+    """A Vertex AI key (starts "AQ.", billed to a Google Cloud project, so Cloud credits apply) goes to Vertex AI, an
+    AI Studio key to the Gemini API: same model, same request (Vertex wants each message's role)."""
+    if str(key).startswith('AQ.'):
+        b = json.loads(body)
+        for c in b.get('contents', []):
+            c.setdefault('role', 'user')
+        url = 'https://aiplatform.googleapis.com/v1/publishers/google/models/%s:generateContent' % VERTEX_MODELS.get(model, model)
+        body = json.dumps(b).encode()
+    else:
+        url = 'https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % model
+    return urllib.request.Request(url, data=body, headers={'x-goog-api-key': key, 'Content-Type': 'application/json'})
 CHUNK_S = 36                           # seconds of sound per request: as live, short for precise timing
 PARALLEL = 16                          # requests in flight (a paid AI Studio key handles this; free tier will wait and retry)
 SR = 16000
@@ -226,8 +241,7 @@ def fix_loanwords(key, lines):
                        "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
                                             "responseSchema": {"type": "OBJECT", "properties": {"lines": {"type": "ARRAY", "items": {"type": "STRING"}}},
                                                                "required": ["lines"]}}}).encode()
-    req = urllib.request.Request('https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % MODEL, data=body,
-                                 headers={'x-goog-api-key': key, 'Content-Type': 'application/json'})
+    req = gemini_request(key, MODEL, body)
     try:
         r = json.load(urllib.request.urlopen(req, timeout=40))
         fixed = json.loads(r['candidates'][0]['content']['parts'][0]['text'])['lines']
@@ -274,7 +288,10 @@ def sound_kind(x):
 
 
 def decode_audio(path, out):
-    run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', path, '-map', '0:a:0', '-ac', '1', '-ar', str(SR), '-f', 's16le', out])
+    # locked to the sound's own timestamps: a broadcast's audio clock can run fast and lose frames, and counted end to
+    # end the sound drifts from the picture (0.15-0.7 s after 13 h of KCTV)
+    run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', path, '-map', '0:a:0', '-ac', '1',
+         '-af', 'aresample=%d:async=1:min_hard_comp=0.02:first_pts=0' % SR, '-f', 's16le', out])
     return np.memmap(out, dtype=np.int16, mode='r')
 
 
@@ -288,8 +305,7 @@ def gemini(key, flac, secs, tries=20):
                        "generationConfig": {"temperature": 0, "responseMimeType": "application/json", "responseSchema": SCHEMA}}).encode()
     for attempt in range(tries):
         model = MODEL                                              # one model only; busy -> wait and try again
-        req = urllib.request.Request('https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent' % model, data=body,
-                                     headers={'x-goog-api-key': key, 'Content-Type': 'application/json'})
+        req = gemini_request(key, model, body)
         try:
             r = json.load(urllib.request.urlopen(req, timeout=120 + secs))
             lines = []
@@ -516,7 +532,8 @@ def main():
     src = input('Path of the recording: ').strip().strip('"').strip("'")
     if not os.path.isfile(src):
         sys.exit('No such file: %s' % src)
-    key = os.environ.get('GEMINI_API_KEY') or getpass.getpass('Google AI Studio (Gemini) API key (not shown as you type): ').strip()
+    key = (os.environ.get('GEMINI_API_KEY') or
+           getpass.getpass('Gemini API key - Google AI Studio, or Vertex AI (starts AQ.) (not shown as you type): ').strip())
     if not key:
         sys.exit('An API key is needed (aistudio.google.com -> Get API key).')
     trim = input('Trim to the broadcast (drop the off-air test signals before and after)? [Y/n]: ').strip().lower() not in ('n', 'no')
@@ -635,9 +652,7 @@ def main():
             if r: lines += r
             else: say('  chunk %d has no subtitles (Gemini kept failing)' % j[0])
         if LIVE:                                              # exactly the live engine's rules, then broadcast shortening
-            say('reading the sound timestamps ...')
-            tl = LIVE.audio_timeline(cut)                  # decoded time drifts from the recording's clock (~0.06 s/h)
-            T = lambda v: LIVE.to_timeline(v, tl) + a_off
+            T = lambda v: v + a_off                        # the decoded sound is on the recording's own clock
             lines = LIVE.fix_foreign(key, sorted(lines))   # a word in the wrong script (garbled Korean) -> English
             cues = LIVE.make_cues([(T(s), T(e), LIVE.dprk_english(t)) for s, e, t in lines],
                                   T(np.sort(np.concatenate(starts))) if starts else None)
