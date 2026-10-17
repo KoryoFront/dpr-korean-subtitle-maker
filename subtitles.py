@@ -637,9 +637,13 @@ def condense_cues(key, cues, cps=20.0):
         if len(plain) / max(0.1, et - st) > cps:
             todo.append((i, plain.startswith('♪'), plain.strip('♪ ').strip(), max(12, int(cps * (et - st)))))
     def ok(old, new, mx):
-        if not new or len(new) > mx + 3:
+        # shorter by enough (to the target, or by 15%+); every number kept; names kept (80%+ of the capitalised
+        # words: in KCTV English most words are capitalised, "Party Central Committee", and all-or-nothing refused
+        # nearly every shortening, 2026-10-17)
+        if not new or (len(new) > mx + 3 and len(new) > 0.85 * len(old)):
             return False
-        return all(n in new for n in re.findall(r'\d+', old)) and all(n in new for n in re.findall(r'\b[A-Z][a-z]+\b', old)[1:])
+        caps = re.findall(r'\b[A-Z][a-z]+\b', old)[1:]
+        return all(n in new for n in re.findall(r'\d+', old)) and (not caps or sum(c in new for c in caps) >= 0.8 * len(caps))
     schema = {"type": "OBJECT", "properties": {"lines": {"type": "ARRAY", "items": {"type": "STRING"}}}, "required": ["lines"]}
     done = 0
     for k in range(0, len(todo), 40):
@@ -1068,6 +1072,8 @@ def split_two(text):
             best = (score, [a, b])
     if best and any(' ' not in x for x in best[1]) and len(text) <= LINE + 4:
         return [text]                                   # a line a little long beats a word on its own
+    if best and best[0] >= 1000 and len(text) > 2 * LINE - 10 and NAME_SAFE_SPLIT:
+        return None                                     # only a break inside a name fits: two subtitles instead
     return best[1] if best else None
 
 
@@ -1113,10 +1119,14 @@ def split_cues(text):
 
 LINGER_S = 0.4                                      # a subtitle stays at most this long after its words end
 LATE_S = 0.1                                  # most a subtitle may start after its voice (see polish)
+SING_SHARE = 0.45                                       # see singing()
+SUNG_MAX_SPEECH = 0.5                                   # see spoken_not_sung
+NAME_SAFE_SPLIT = True                                  # see split_two
+READ_CPS, READ_MIN_S = 17.0, 1.2                       # reading speed and the shortest subtitle
 LEAD_S = 0.0                                  # a subtitle never shows before its voice (user: 'start early')
 
 
-def make_cues(lines, onsets=None):
+def make_cues(lines, onsets=None, open_end=False):
     """Lines (start, end, english) -> finished subtitles (start, end, 'line1\nline2') following subtitle rules:
     songs dropped and overlaps tidied (tidy_lines), clean text, at most 2 balanced lines of 42, long lines split
     at clause breaks with time shared by length, at least 1 s / ~17 characters per second on screen (stretching
@@ -1159,7 +1169,16 @@ def make_cues(lines, onsets=None):
             c[1] = max(c[1], c[0] + 0.83)
             continue
         c[1] = min(c[1], c[0] + 7.0, nxt - 0.08 if i + 1 < len(cues) else c[1])
-        c[1] = min(c[1], max(c[4] + LINGER_S, c[0] + 0.83))   # ends with the words (+0.4 s); too dense -> condensed
+        # ends with the words (+0.4 s), but never before it can be read (~17 characters a second, at least 1.2 s):
+        # it then stays on into the free time after, up to the next subtitle (user, 2026-10-17: "subs only show for
+        # like a second, I can't read them")
+        c[1] = min(max(c[4] + LINGER_S, c[0] + max(READ_MIN_S, len(c[2]) / READ_CPS)), c[0] + 7.0)
+        if i + 1 < len(cues):
+            c[1] = min(c[1], cues[i + 1][0] - 0.08)
+        elif open_end:
+            # live: what follows is in the next batch, which can't overlap a subtitle already published and would
+            # push its first line late (2026-10-17 waveform check: 27% of starts late) -> no reading extension here
+            c[1] = min(c[1], max(c[4] + LINGER_S, c[0] + READ_MIN_S))
         c[1] = max(c[1], c[0] + 0.83)                                       # broadcast minimum: 5/6 of a second
     cues = polish(cues)
     return [(c[0], c[1], song_marks(split_two(c[2]) or [c[2]]) if c[3] else '\n'.join(split_two(c[2]) or [c[2]])) for c in cues]
@@ -1208,12 +1227,23 @@ def polish(cues):
         need = 0.83 - (c[1] - c[0])
         if need <= 0:
             continue
-        lead = max(0.0, min(need, 2 * LEAD_S, c[0] - (out[i - 1][1] + 0.08 if i else 0)))
-        c[0] -= lead; need -= lead
-        if need > 0 and i:
-            p = out[i - 1]
-            take = max(0.0, min(need, (p[1] - p[0]) - max(0.83, len(p[2]) / 17.0)))
-            p[1] -= take; c[0] -= take
+        # never by starting earlier (user, 2026-10-17: "lines show before it is said"): only into free time after
+        nxt = out[i + 1][0] - 0.08 if i + 1 < len(out) else c[1] + need
+        c[1] = max(c[1], min(c[0] + 0.83, nxt))
+    # fragments too short to read (a long sentence cut into pieces): join neighbours into one subtitle when they
+    # follow on and together fit two lines and 7 s (2026-10-16 day file: 183 subtitles under 0.83 s)
+    merged = []
+    for c in out:
+        if merged:
+            p = merged[-1]
+            short = (p[1] - p[0] < READ_MIN_S) or (c[1] - c[0] < READ_MIN_S)
+            joined = p[2] + ' ' + c[2]
+            if (short and p[3] == c[3] and c[0] - p[1] <= 0.3 and c[1] - p[0] <= 7.0 and split_two(joined)
+                    and len(joined) <= 2 * LINE):
+                p[1], p[2], p[4] = c[1], joined, c[4]
+                continue
+        merged.append(c)
+    out = merged
     for i in range(1, len(out)):
         a, b = out[i - 1], out[i]
         if b[0] < a[1] + 0.08 and a[1] - a[0] <= 0.9 and b[1] - (a[1] + 0.08) >= 1.2 and a[1] + 0.08 - b[0] <= late(b):
@@ -1336,7 +1366,7 @@ def vocal_starts(x, depth=8.0):
 def voice_starts(x):
     """Every place the voice starts or resumes in x: after silence (speech_onsets) or after a short pause (pause_ends).
     make_cues puts the break between two parts of a long line on one of these."""
-    return np.unique(np.round(np.concatenate([speech_onsets(x), pause_ends(x), vocal_starts(x)]), 2))
+    return np.unique(np.round(np.concatenate([speech_onsets(x), pause_ends(x)]), 2))   # (vocal_starts fired on every syllable)
 
 
 def align_score(lines, x):
@@ -1418,6 +1448,18 @@ def speech_gaps(lines, x, min_s=4.0):
 def fill_gaps(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
     """Speech left without subtitles (speech_gaps): ask Gemini again for the chunk and take only the new lines that
     fall in the gaps and touch no line already there. Lines stay as Gemini gave them (timed later, like the rest)."""
+    # first, each gap on its own: the gap's sound with a second either side. A short clip keeps Gemini on the words
+    # it skipped (2026-10-17 music video: a repeated chorus stayed missing when the whole chunk was asked again)
+    for g0, g1 in speech_gaps(lines, x)[:3]:
+        if time.time() > deadline - 25:
+            break
+        a0, a1 = max(0.0, g0 - 1.0), min(len(x) / 16000, g1 + 1.0)
+        new = gemini.subtitles(to_flac(x[int(a0 * 16000):int(a1 * 16000)]), a1 - a0, deadline, True)
+        add = [(st + a0, et + a0, en) for st, et, en in (new or [])]
+        add = [l for l in add if g0 - 1 <= (l[0] + l[1]) / 2 <= g1 + 1 and not any(l[0] < et and st < l[1] for st, et, en in lines)]
+        if add:
+            log('filled %d s of speech without subtitles with %d line(s) (gap asked alone)' % (g1 - g0, len(add)))
+            lines = sorted(list(lines) + add)
     for attempt in range(tries):
         gaps = speech_gaps(lines, x)
         if not gaps or time.time() > deadline - 20:
@@ -1536,6 +1578,24 @@ def quiet_onsets(x):
     return np.array(out)
 
 
+def singing(x):
+    """Per 10 ms frame of x: is someone singing? The share of the 300-3500 Hz energy that is neither steady along time
+    (instrument notes) nor steady along frequency (drums) -- a voice's vibrato and glides (2026-10-17: matched every
+    sung phrase on a KCTV music video). None without scipy."""
+    try:
+        from scipy.ndimage import median_filter
+    except Exception:
+        return None
+    nfft, hop = 1024, 160
+    fr = np.lib.stride_tricks.sliding_window_view(np.pad(np.asarray(x, dtype=np.float32), (nfft // 2, nfft // 2)), nfft)[::hop]
+    M = np.abs(np.fft.rfft(fr * np.hanning(nfft), axis=1)) ** 2
+    f = np.fft.rfftfreq(nfft, 1 / 16000)
+    M = M[:, (f > 300) & (f < 3500)]
+    R = np.clip(M - np.maximum(median_filter(M, size=(31, 1)), median_filter(M, size=(1, 17))), 0, None)
+    share = np.convolve(R.sum(axis=1) / (M.sum(axis=1) + 1e-12), np.ones(20) / 20, 'same')
+    return share > SING_SHARE
+
+
 def timed_lines(lines, x, words=None, korean=None):
     """The timing, as measured best (2026-10-17, against clear speech starts and two recognisers' word ends):
     start = the point where speech resumes after a pause nearest to the mean of Gemini's start and Speech-to-Text's
@@ -1544,10 +1604,33 @@ def timed_lines(lines, x, words=None, korean=None):
     qon = quiet_onsets(x)
     offs = speech_ends(x)
     snapped = {l[2]: l for l in snap_to_speech_plain(lines, x)}
+    sing = singing(x) if any(l[2].startswith('♪') for l in lines) else None
+    talk = None
     out = []
-    for st, et, en in lines:
+    for i, (st, et, en) in enumerate(lines):
         if en.startswith('♪'):
+            # a lyric stays up while the singer still sings (held notes), up to the next line and 7 s
+            if sing is not None:
+                nxt = min([l[0] for l in lines if l[0] > st + 0.3] or [len(x) / 16000])
+                k, lim = int(et * 100), int(min(nxt - 0.08, st + 7.0) * 100)
+                quiet = 0
+                while k < min(lim, len(sing)) and quiet < 30:
+                    quiet = 0 if sing[k] else quiet + 1
+                    k += 1
+                et = max(et, (k - quiet) / 100)
             out.append((st, et, en)); continue
+        if et - st >= 2.0 and _vad is not None:
+            # a spoken line of 2 s+ with (almost) no speech under it was invented over music (2026-10-17: "Guided by
+            # the WPK" over an instrumental); short quiet drama lines are kept (3 of 255 real lines score that low)
+            if talk is None:
+                try:
+                    talk = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5))
+                except Exception:
+                    talk = []
+            heard = sum(max(0.0, min(t['end'] / 16000, et + 0.3) - max(t['start'] / 16000, st - 0.3)) for t in talk)
+            if talk and heard < 0.05 * (et - st):
+                log('dropped a line with no speech under it: %r' % en[:60])
+                continue
         span = word_span((korean or {}).get(en), words, st - 4, et + 4) if words else None
         guess = (st + span[0] + 0.5) / 2 if span and span[0] is not None else st
         # Gemini starts lines early (median 0.3 s, often 1-2 s): look further after its start than before, but only
@@ -1588,6 +1671,29 @@ def timed_lines(lines, x, words=None, korean=None):
                      # Whole-chunk shifts, re-asking a badly timed chunk and dropping lines over silence stay.
 
 
+def spoken_not_sung(lines, x, korean=None):
+    """A line Gemini marked as a song but that the Silero speech detector hears as speech is speech: someone talking
+    over music (user, 2026-10-17). Tested: real lyrics are covered by detected speech ~0% of their time (48 lines,
+    two music videos: none over 50%), spoken lines ~83% (86-99% over 50%), the mislabelled narration 64-78%."""
+    if _vad is None or not any(l[2].startswith('♪') for l in lines):
+        return lines
+    try:
+        ts = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5))
+    except Exception:
+        return lines
+    out = []
+    for st, et, en in lines:
+        if en.startswith('♪'):
+            heard = sum(max(0.0, min(t['end'] / 16000, et) - max(t['start'] / 16000, st)) for t in ts)
+            if heard > SUNG_MAX_SPEECH * max(0.1, et - st):
+                plain = en.lstrip('♪ ').strip()
+                if korean is not None and en in korean:
+                    korean[plain] = korean[en]
+                en = plain
+        out.append((st, et, en))
+    return out
+
+
 def snap_to_speech(lines, x, words=None, korean=None):
     """The timing of a chunk's lines (seconds into x, 16 kHz): see timed_lines. words: Speech-to-Text words for x (or
     None), korean: English line -> its Korean (Gemini.korean). First, a line over (near) silence is dropped: Gemini
@@ -1597,6 +1703,7 @@ def snap_to_speech(lines, x, words=None, korean=None):
     lines = [l for l in lines if voiced_seconds(x, l[0] - 0.3, l[1] + 0.3) >= 0.08]
     if not lines:
         return lines
+    lines = spoken_not_sung(lines, x, korean)
     if words is not None or not SNAP_LINES:
         return timed_lines(lines, x, words, korean)
     return snap_to_speech_plain(lines, x)
@@ -1880,7 +1987,7 @@ class Channel(threading.Thread):
                     lines = fix_foreign(self.gemini.key, lines)                                     # garbled script
                 if lines:                                   # timed once, here (Speech-to-Text words when configured)
                     words = stt_words(STT_KEY, audio) if STT_KEY else None
-                    cues = make_cues(snap_to_speech(lines, audio, words, self.gemini.korean if self.gemini else None), voice_starts(audio))
+                    cues = make_cues(snap_to_speech(lines, audio, words, self.gemini.korean if self.gemini else None), voice_starts(audio), open_end=True)
                 else:
                     cues = []
                 if cues and self.gemini and time.time() < deadline - 20:
