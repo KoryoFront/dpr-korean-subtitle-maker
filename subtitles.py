@@ -384,6 +384,7 @@ GEMINI_SCHEMA = {"type": "OBJECT", "properties": {"segments": {"type": "ARRAY", 
 class Gemini:
     def __init__(self, key):
         self.key = key
+        self.korean = {}                                   # English line -> the Korean Gemini heard
         self.until = 0.0
         self.errors = []                                           # times of failed requests (for the admin panel)
         self.lock = threading.Lock()
@@ -560,6 +561,7 @@ class Gemini:
                     en = dprk_english(en)
                     note_unknown_words(en, ko)
                     out.append((st, et, ('♪ ' + en) if is_song(kind, ko, en) else en))
+                    self.korean[out[-1][2]] = ko          # kept so a recording can be re-timed later from the words
                 return out
             except urllib.error.HTTPError as e:
                 log('Gemini HTTP', e.code, model)
@@ -1344,9 +1346,10 @@ def align_score(lines, x):
 
 
 def well_aligned(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
-    """Snap a chunk's lines to the voice; if fewer than 60% of its spoken lines then start on speech (Gemini timed the
-    chunk badly), ask Gemini again (up to `tries` times, while time allows) and keep the best-aligned answer."""
-    best = snap_to_speech(lines, x)
+    """If fewer than 60% of a chunk's spoken lines start on speech (Gemini timed the chunk badly), ask Gemini again (up
+    to `tries` times, while time allows) and keep the best-aligned answer. Returns Gemini's lines as given (timing is
+    applied afterwards by snap_to_speech, so a stored answer can always be re-timed)."""
+    best, raw = snap_to_speech(lines, x), lines
     score, n = align_score(best, x)
     for attempt in range(tries):
         if score >= 0.6 or n < 3 or time.time() > deadline - 20:
@@ -1357,8 +1360,8 @@ def well_aligned(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
         cand = snap_to_speech(new, x)
         cs, cn = align_score(cand, x)
         if cs > score and cn >= 0.7 * n:                  # better timed, and not by dropping lines
-            best, score, n = cand, cs, cn
-    return best
+            best, raw, score, n = cand, new, cs, cn
+    return raw
 
 
 FOREIGN = re.compile(r'[^\x00-\x7F♪‘’“”—–…°·éèêáàâüöäïçñ]')
@@ -1410,7 +1413,7 @@ def speech_gaps(lines, x, min_s=4.0):
 
 def fill_gaps(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
     """Speech left without subtitles (speech_gaps): ask Gemini again for the chunk and take only the new lines that
-    fall in the gaps and touch no line already there. Lines are snapped to the voice like the rest."""
+    fall in the gaps and touch no line already there. Lines stay as Gemini gave them (timed later, like the rest)."""
     for attempt in range(tries):
         gaps = speech_gaps(lines, x)
         if not gaps or time.time() > deadline - 20:
@@ -1418,13 +1421,33 @@ def fill_gaps(gemini, flac, x, seconds, deadline, expect, lines, tries=2):
         new = gemini.subtitles(flac, seconds, deadline, expect)
         if not new:
             continue
-        add = [l for l in snap_to_speech(new, x)
+        add = [l for l in new
                if any(g0 - 1 <= (l[0] + l[1]) / 2 <= g1 + 1 for g0, g1 in gaps)
                and not any(l[0] < et and st < l[1] for st, et, en in lines)]
         if add:
             log('filled %d s of speech without subtitles with %d line(s)' % (sum(g1 - g0 for g0, g1 in gaps), len(add)))
             lines = sorted(list(lines) + add)
     return lines
+
+
+try:                                     # Silero speech detector (from faster-whisper): tells speech from music
+    _venv = '/DATA/subs/tools/venv/lib/python%d.%d/site-packages' % sys.version_info[:2]
+    if os.path.isdir(_venv) and _venv not in sys.path:
+        sys.path.append(_venv)
+    from faster_whisper.vad import get_speech_timestamps as _vad, VadOptions as _VadOptions
+except Exception:
+    _vad = None
+
+
+def speech_ends(x):
+    """Times (s into x, 16 kHz) where speech stops, by the Silero speech detector; empty without it."""
+    if _vad is None or len(x) < 16000:
+        return np.array([])
+    try:
+        ts = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0))
+    except Exception:
+        return np.array([])
+    return np.array([t['end'] / 16000 for t in ts])
 
 
 SNAP_LINES = False   # starts: Gemini's own (user, 2026-10-17, and the A/B test below); ends: snapped to the voice.
@@ -1442,6 +1465,20 @@ def snap_to_speech(lines, x):
     lines = [l for l in lines if voiced_seconds(x, l[0] - 0.3, l[1] + 0.3) >= 0.08]
     if not lines:
         return lines
+    if not SNAP_LINES:
+        # Measured 2026-10-17 against Speech-to-Text and Whisper word times (84 lines, 6 windows): Gemini's own start
+        # is the best start we have for free (the whole-chunk shift made 31 of 84 later and worse); the best free end
+        # is where the Silero speech detector says the speech stops (73-78% within 0.5 s, vs 57% Gemini, 57-61% by
+        # sound level). Without Silero, Gemini's end.
+        offs = speech_ends(x)
+        out = []
+        for st, et, en in lines:
+            if not en.startswith('♪') and len(offs):
+                c = offs[(np.abs(offs - et) <= 1.0) & (offs > st + 0.3)]
+                if len(c):
+                    et = float(c[np.argmin(np.abs(c - et))])
+            out.append((st, max(et, st + 0.5), en))
+        return out
     hop = 320                                                  # 20 ms
     n = len(x) // hop
     fr = x[:n * hop].reshape(n, hop).astype(np.float32)
@@ -1465,20 +1502,6 @@ def snap_to_speech(lines, x):
         d, base = float(shifts[k]), score(0.0)
         if abs(d) >= 0.4 and sc[k] >= base + 1.0 and sc[k] >= 1.3 * max(base, 0.5):
             lines = [(st + d, et + d, en) if not en.startswith('♪') else (st, et, en) for st, et, en in lines]
-    if not SNAP_LINES:
-        # A/B test against Speech-to-Text word times (2026-10-17, 42 lines): Gemini's own starts are closer (36% within
-        # 0.5 s vs 26% snapped), snapped ends are closer (62% vs 43%). So: Gemini's start, the end where the voice stops.
-        m = len(x) // 160
-        fdb = 20 * np.log10(np.sqrt((x[:m * 160].reshape(m, 160).astype(np.float32) ** 2).mean(axis=1)) + 1e-9)
-        out = []
-        for st, et, en in lines:
-            if not en.startswith('♪'):
-                c = off[(off >= et - 0.6) & (off <= et + 1.0) & (off > st + 0.6)]
-                if len(c):
-                    et = float(c[np.argmin(np.abs(c - et))])
-                et = fine_edges(fdb, st, et)[1]
-            out.append((st, max(et, st + 0.5), en))
-        return out
     out = []
     for st, et, en in lines:
         c = on[(on >= st - 1.0) & (on <= st + 0.6)]
@@ -1727,7 +1750,7 @@ class Channel(threading.Thread):
                     lines = well_aligned(self.gemini, flac, audio, secs, deadline, expect, lines)   # badly timed: ask again
                     lines = fill_gaps(self.gemini, flac, audio, secs, deadline, expect, lines)      # speech left out
                     lines = fix_foreign(self.gemini.key, lines)                                     # garbled script
-                cues = make_cues(lines, voice_starts(audio)) if lines else []   # lines are snapped already: once only
+                cues = make_cues(snap_to_speech(lines, audio), voice_starts(audio)) if lines else []   # timed once, here
                 if cues and self.gemini and time.time() < deadline - 20:
                     cues = condense_cues(self.gemini.key, cues)                         # too dense to read: shorten
                 return (None if lines is None else cues), time.time() - t0

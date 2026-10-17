@@ -637,6 +637,8 @@ def main():
                     os.replace(f + '.tmp', f)
             else:
                 out = snap_to_speech([tuple(x) for x in out], xc)
+            if LIVE and out:                                  # the timing: Gemini's start, the end where speech stops
+                out = LIVE.snap_to_speech([tuple(l[:3]) for l in out], xc)
             if LIVE:
                 with lock:
                     starts.append(c0 + LIVE.voice_starts(xc))   # where the voice resumes: long lines break there

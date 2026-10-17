@@ -14,7 +14,7 @@ For `recording.ts` it writes, next to it:
 
 ## Requirements
 
-- Python 3.8 or newer, with numpy: `pip install -r requirements.txt`
+- Python 3.8 or newer, with numpy and faster-whisper (its Silero speech detector decides where each subtitle ends): `pip install -r requirements.txt`
 - ffmpeg and ffprobe on the PATH: https://ffmpeg.org/download.html
 - A Gemini API key, either:
   - Google AI Studio, with billing (prepaid credit) enabled: https://aistudio.google.com

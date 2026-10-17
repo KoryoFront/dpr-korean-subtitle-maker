@@ -1,1 +1,2 @@
 numpy>=1.22
+faster-whisper>=1.0   # only for its Silero speech detector: where each subtitle ends
