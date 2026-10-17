@@ -674,13 +674,26 @@ def main():
 
     # 4. MKV: picture and sound copied untouched, plus the English track; then check every packet is there
     say('building the MKV ...')
+    a = count_packets(cut)
+    # mkvmerge (MKVToolNix) when installed: the reference Matroska muxer, safest for interlaced broadcast picture
+    if shutil.which('mkvmerge'):
+        r = subprocess.run(['mkvmerge', '-q', '-o', mkv + '.part.mkv', '--title', '%s (English subtitles, machine translated)'
+                            % os.path.basename(base), cut, '--language', '0:eng', '--track-name', '0:English',
+                            '--default-track-flag', '0:yes', srt])
+        b = count_packets(mkv + '.part.mkv') if r.returncode in (0, 1) else None
+        if b and (a['video'], a['audio']) == (b['video'], b['audio']):
+            os.replace(mkv + '.part.mkv', mkv)
+            shutil.rmtree(W, ignore_errors=True)
+            say('done (every picture and sound packet checked):\n  %s\n  %s' % (mkv, srt))
+            return
+        say('mkvmerge result refused, building with ffmpeg instead ...')
     run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-fflags', '+genpts', '-i', cut, '-i', srt, '-map', '0:v:0', '-map', '0:a:0', '-map', '1:0',
          '-c', 'copy', '-c:s', 'srt',
          '-bsf:v', 'setts=pts=if(eq(PTS\\,NOPTS)\\,PREV_OUTPTS+3600\\,PTS):dts=if(eq(DTS\\,NOPTS)\\,PREV_OUTDTS+3600\\,DTS)',
          '-metadata:s:s:0', 'language=eng', '-metadata:s:s:0', 'title=English', '-disposition:s:0', 'default',
          '-metadata', 'title=%s (English subtitles, machine translated)' % os.path.basename(base), mkv + '.part.mkv'])
     say('checking that every picture and sound packet is in the MKV ...')
-    a, b = count_packets(cut), count_packets(mkv + '.part.mkv')
+    b = count_packets(mkv + '.part.mkv')
     if (a['video'], a['audio']) != (b['video'], b['audio']):
         sys.exit('Check failed: source %s, MKV %s. The work folder is kept: %s' % (a, b, W))
     os.replace(mkv + '.part.mkv', mkv)
