@@ -812,6 +812,7 @@ def time_songs(lines, v):
 
 
 CAPTION_MODEL = 'gemini-3.5-flash'   # reads KCTV's stylised lyric font; Flash-Lite misread it (훨한 for 험한), user 2026-10-18
+CAPTION_MIN_S = 2.5                  # verses stay up 5 s+; a shorter caption was a title card (2026-10-17 13:42:23)
 CAPTION_SCHEMA = {"type": "OBJECT", "properties": {"frames": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
     "t": {"type": "NUMBER"}, "text": {"type": "STRING"}}, "required": ["t", "text"]}}}, "required": ["frames"]}
 
@@ -888,8 +889,8 @@ def lyrics_from_captions(lines, verses, english, lo, hi):
     spans = []
     for vs, ve, rows in verses:
         en = english[k:k + len(rows)]; k += len(rows)
-        if not all(en) or ve < lo or vs >= hi:
-            continue
+        if not all(en) or ve < lo or vs >= hi or ve - vs < CAPTION_MIN_S:
+            continue                                     # (a caption up for a moment is a title card, not a verse)
         spans.append((vs - 1.0, ve + 0.5))               # a verse from the piece before still covers its heard lyrics
         if not (lo <= vs < hi):
             continue
@@ -906,7 +907,9 @@ def lyrics_from_captions(lines, verses, english, lo, hi):
             new.append((a, max(a + 0.8, min(b, a + 7.0)), '♪ ' + e))
     if not spans:
         return lines
-    kept = [l for l in out if not (l[2].startswith('♪') and any(a <= l[0] <= b for a, b in spans))]
+    # a music video puts every sung line on screen: in a piece with lyric captions, a lyric heard only in the sound
+    # (no caption then) was not sung (2026-10-17 13:42:23: "Living with the motherland" over a wordless choir)
+    kept = [l for l in out if not l[2].startswith('♪')]
     return sorted(kept + new)
 
 
@@ -1525,8 +1528,8 @@ def make_cues(lines, onsets=None, open_end=False):
         if c[3] and SONG_RAW:
             # lyrics keep Gemini's times exactly (user, 2026-10-18: "music is sometimes slow"): only cut short where
             # the next subtitle begins
-            c[1] = min(c[4], nxt - 0.08) if i + 1 < len(cues) else c[4]
-            c[1] = max(c[1], c[0] + 0.3)
+            c[1] = min(c[4], nxt - 0.08, c[0] + 7.0) if i + 1 < len(cues) else min(c[4], c[0] + 7.0)
+            c[1] = max(c[1], min(c[0] + 0.83, nxt - 0.08) if i + 1 < len(cues) else c[0] + 0.83)   # readable if room
             continue
         if c[3]:
             # a sung line stays up through its held notes: until the next lyric (if it follows within 3 s; user,
@@ -2177,7 +2180,9 @@ def snap_to_speech(lines, x, words=None, korean=None):
     sometimes invents one there ("This is Korean Central Television" over 3 s of silence)."""
     if not lines or len(x) < 16000:
         return lines
-    lines = [l for l in lines if voiced_seconds(x, l[0] - 0.3, l[1] + 0.3) >= 0.08]
+    # (a line starting where this piece's sound has ended -- the second row of an on-screen verse running into the
+    # next piece -- cannot be judged here and is kept)
+    lines = [l for l in lines if l[0] > len(x) / 16000 - 0.5 or voiced_seconds(x, l[0] - 0.3, l[1] + 0.3) >= 0.08]
     if not lines:
         return lines
     lines = spoken_not_sung(lines, x, korean)
