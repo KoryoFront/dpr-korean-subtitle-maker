@@ -811,6 +811,105 @@ def time_songs(lines, v):
     return out
 
 
+CAPTION_MODEL = 'gemini-3.5-flash'   # reads KCTV's stylised lyric font; Flash-Lite misread it (훨한 for 험한), user 2026-10-18
+CAPTION_SCHEMA = {"type": "OBJECT", "properties": {"frames": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+    "t": {"type": "NUMBER"}, "text": {"type": "STRING"}}, "required": ["t", "text"]}}}, "required": ["frames"]}
+
+
+def read_captions(key, video, t0, t1, fps=2.0, batch=40):
+    """The song-lyric captions burned into a stretch of video (KCTV music videos write the Korean lyrics on screen,
+    karaoke style: each syllable appears as it is sung). Frames of the lower half of the screen (the lyrics can be
+    anywhere there, user 2026-10-18) every 1/fps s, read by Gemini. Returns [(t, text)] in the video's seconds, text
+    with one line per row; None if reading failed."""
+    r = subprocess.run(['nice', '-n', '19', 'ffmpeg', '-v', 'quiet', '-ss', '%.3f' % max(0.0, t0), '-i', video, '-t', '%.3f' % (t1 - t0),
+                        '-vf', 'yadif,fps=%g,crop=iw:ih/2:0:ih/2,scale=640:-2' % fps, '-q:v', '4', '-f', 'image2pipe',
+                        '-vcodec', 'mjpeg', '-'], capture_output=True, timeout=300).stdout
+    jpgs = [b'\xff\xd8' + q for q in r.split(b'\xff\xd8')[1:]]
+    out = []
+    for b0 in range(0, len(jpgs), batch):
+        parts = []
+        for k in range(b0, min(len(jpgs), b0 + batch)):
+            parts += [{"text": "t=%.1f" % (k / fps)}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(jpgs[k]).decode()}}]
+        parts.append({"text": "These are frames, at the times given, of the lower half of the screen of a North Korean TV music video. "
+                      "For each frame give the Korean SONG LYRIC caption exactly as written, with a line break (\\n) between its rows. "
+                      "Only sung lyrics: ignore song titles, credits, names, channel logos, clocks and any other text. Empty text if "
+                      "no lyric caption is on screen. Return {\"frames\": [{\"t\", \"text\"}]} with every frame."})
+        v = gemini_json(key, parts, CAPTION_SCHEMA, model=CAPTION_MODEL, tries=3)
+        got = {round(float(f.get('t', -1)), 1): str(f.get('text') or '').strip() for f in (v or {}).get('frames', []) if isinstance(f, dict)}
+        if len(got) < 0.9 * (min(len(jpgs), b0 + batch) - b0):
+            log('captions: %d of %d frames read at %.0f s' % (len(got), min(len(jpgs), b0 + batch) - b0, t0 + b0 / fps))
+            return None
+        out += [(t0 + k / fps, got.get(round(k / fps, 1), '')) for k in range(b0, min(len(jpgs), b0 + batch))]
+    return out
+
+
+def caption_verses(frames):
+    """Caption frames -> verses [(start, end, [korean rows])]: a verse starts when its caption appears and ends when
+    it is cleared or replaced. (The captions wipe in over a few seconds, both rows together: when the caption appears
+    is when the verse is sung, not when each row is, user check 2026-10-18 on the music video at 2:57.)"""
+    out, verse, start, full = [], None, None, []
+    dt = frames[1][0] - frames[0][0] if len(frames) > 1 else 0.5
+    for t, text in frames + [(frames[-1][0] + dt, '')] if frames else []:
+        r = [q.strip() for q in text.split('\n') if q.strip()]
+        if verse is not None and (not r or r[0][:1] != verse[0][:1]):
+            out.append((start, t - dt / 2, [q for q in full if q]))
+            verse = None
+        if r:
+            if verse is None:
+                start, full = t - dt / 2, []
+            verse = r
+            for k, q in enumerate(r):
+                if k >= len(full):
+                    full.append(q)
+                elif len(q) >= len(full[k]):
+                    full[k] = q
+    return [v for v in out if v[2]]
+
+
+def translate_lyrics(key, rows):
+    """Korean lyric rows -> English subtitle lines, one per row, in DPRK house style."""
+    if not rows:
+        return []
+    sch = {"type": "OBJECT", "properties": {"lines": {"type": "ARRAY", "items": {"type": "STRING"}}}, "required": ["lines"]}
+    v = gemini_json(key, [{"text": "Translate these Korean song lyric lines from North Korean television into English subtitles, "
+                                   "one English line per Korean line, in the same order, natural and singable, short. " + DPRK_STYLE +
+                                   "\nReturn {\"lines\": [...]} with exactly %d lines.\n" % len(rows) +
+                                   '\n'.join('%d. %s' % (i + 1, r) for i, r in enumerate(rows))}], sch, tries=3)
+    out = [str(x).strip() for x in (v or {}).get('lines', [])]
+    return [dprk_english(x) for x in out] if len(out) == len(rows) else None
+
+
+def lyrics_from_captions(lines, verses, english, lo, hi):
+    """Replace the lyric lines Gemini heard with the on-screen ones, for verses starting in lo..hi (the lines' clock).
+    english: one line per row of the verses, in order. A verse's first row starts when its caption appears; the later
+    rows where the heard lyric lines start (timed on the singer) when there are as many of them, else by the rows'
+    length; the last row lasts until the caption goes. Heard lyrics in the stretch the captions cover are dropped."""
+    out, k, new = list(lines), 0, []
+    spans = []
+    for vs, ve, rows in verses:
+        en = english[k:k + len(rows)]; k += len(rows)
+        if not all(en) or ve < lo or vs >= hi:
+            continue
+        spans.append((vs - 1.0, ve + 0.5))               # a verse from the piece before still covers its heard lyrics
+        if not (lo <= vs < hi):
+            continue
+        heard = [l for l in lines if l[2].startswith('♪') and vs - 1.0 <= l[0] < ve - 0.5]
+        if len(rows) > 1 and len(heard) == len(rows):
+            starts = [vs] + [max(vs + 0.8 * n, l[0]) for n, l in enumerate(heard[1:], 1)]
+        else:
+            tot = sum(len(r) for r in rows) or 1
+            starts, done = [], 0
+            for r in rows:
+                starts.append(vs + (ve - vs) * done / tot); done += len(r)
+        for n, (a, e) in enumerate(zip(starts, en)):
+            b = starts[n + 1] - 0.08 if n + 1 < len(starts) else ve
+            new.append((a, max(a + 0.8, min(b, a + 7.0)), '♪ ' + e))
+    if not spans:
+        return lines
+    kept = [l for l in out if not (l[2].startswith('♪') and any(a <= l[0] <= b for a, b in spans))]
+    return sorted(kept + new)
+
+
 def voice_kind(x, v, ts, st, et):
     """('speech' | 'sung' | 'none', numbers) for a line at st..et of x (widened 1 s: the times are Gemini's), from its
     separated voice v and Silero runs ts on v. Measured 2026-10-17: narration over music is talk on the voice track

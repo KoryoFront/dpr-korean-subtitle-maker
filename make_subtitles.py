@@ -640,6 +640,22 @@ def main():
             if LIVE and out:                                  # the timing (subtitles.timed_lines)
                 g = _live_gemini.setdefault(key, LIVE.Gemini(key))
                 out = LIVE.song_check(key, xc, [tuple(l[:3]) for l in out])   # 'songs' that are speech or not there
+                if any(l[2].startswith('♪') for l in out):
+                    # a music video writes its lyrics on screen (lower half): those words, verse by verse as they appear
+                    fc = W + 'chunks/%05d.captions.json' % ci
+                    cap = json.load(open(fc, encoding='utf-8')) if os.path.exists(fc) else None
+                    if cap is None:
+                        fr = LIVE.read_captions(key, cut, c0 + a_off - 2, c1 + a_off + 10)
+                        if fr is not None:
+                            V = LIVE.caption_verses([(t - a_off - c0, q) for t, q in fr])
+                            en = LIVE.translate_lyrics(key, [r for v in V for r in v[2]]) if V else []
+                            if en is not None:
+                                cap = {'verses': V, 'english': en}
+                                with open(fc + '.tmp', 'w', encoding='utf-8') as fh:
+                                    json.dump(cap, fh, ensure_ascii=False)
+                                os.replace(fc + '.tmp', fc)
+                    if cap and cap['verses']:
+                        out = LIVE.lyrics_from_captions(out, [tuple(v) for v in cap['verses']], cap['english'], 0.0, float(c1 - c0))
                 out = LIVE.snap_to_speech(out, xc, None, g.korean)
             if LIVE:
                 with lock:
