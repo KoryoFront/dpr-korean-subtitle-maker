@@ -909,7 +909,9 @@ def lyrics_from_captions(lines, verses, english, lo, hi):
                 starts.append(vs + (ve - vs) * done / tot); done += len(r)
         for n, (a, e) in enumerate(zip(starts, en)):
             b = starts[n + 1] - 0.08 if n + 1 < len(starts) else ve
-            new.append((a, max(a + 0.8, min(b, a + 7.0)), '♪ ' + e))
+            # the whole row: a lyric line sung over 14 s is split into its subtitles across all of it (capped at 7 s
+            # it was squeezed into the first half, user 2026-10-18 at 0:47:11); each subtitle still at most 7 s
+            new.append((a, max(a + 0.8, b), '♪ ' + e))
     if not spans:
         return lines
     # a music video puts every sung line on screen: in a piece with lyric captions, a lyric heard only in the sound
@@ -1939,6 +1941,7 @@ STT_KEY = None                                          # set from the config (s
 EXTEND_ENDS = False                                     # (Speech-to-Text only) tested: no better
 WORD_GAP_ENDS = False                                   # (Speech-to-Text only) tested: worse
 END_TRIM_S = 0.1                                        # Silero stops a little late
+HOLD_CAP = os.environ.get('HOLD_CAP', '1') == '1'
 INSPEECH_KEEP = os.environ.get('INSPEECH_KEEP', '0') == '1'   # tested 2026-10-18: clear starts 97->91%, no gain inside speech
 INSPEECH_MIN = float(os.environ.get('INSPEECH_MIN', '0.3'))
 INSPEECH_SNAP = float(os.environ.get('INSPEECH_SNAP', '0.3'))   # a real pause onset this close still wins
@@ -2172,6 +2175,21 @@ def timed_lines(lines, x, words=None, korean=None):
                     c = offs[(offs > s2 + 0.3) & (offs <= et + 1.0) & (np.abs(offs - est) <= 1.5)]
                     et = est
             e2 = (float(c[np.argmin(np.abs(c - et))]) if len(c) else et) - END_TRIM_S
+        if HOLD_CAP and _vad is not None:
+            # held too long (user, 2026-10-18): with no stop found near Gemini's end, its end (often seconds late)
+            # stood. If the speech detector hears the line clearly and the talking stops 1 s+ before that end with
+            # nothing after, the line ends with the talking. Lines it hardly hears (singing) keep their end.
+            if talk is None:
+                try:
+                    talk = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5))
+                except Exception:
+                    talk = []
+            inside = [(r['start'] / 16000, r['end'] / 16000) for r in talk if r['start'] / 16000 < e2 and r['end'] / 16000 > s2]
+            if inside and e2 - s2 > 1.0:
+                heard_s = sum(min(b_, e2) - max(a_, s2) for a_, b_ in inside)
+                last = max(b_ for _, b_ in inside)
+                if heard_s >= 0.4 * (e2 - s2) and last < e2 - 1.0:
+                    e2 = max(last - END_TRIM_S, s2 + 0.8)
         out.append([s2, max(e2, s2 + 0.5), en]); guesses.append(guess)
     out.sort(key=lambda l: l[0])
     for i in range(len(out) - 1):                         # a line never runs on past the start of the next
