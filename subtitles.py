@@ -331,6 +331,9 @@ SOUTH_TO_DPRK = [(r"\bBaekdu\b", "Paektu"), (r"\bPyeongyang\b", "Pyongyang"), (r
                  # 리, the distance (three-thousand-ri land, 130 ri): DPRK English writes ri; capital Li (Chinese
                  # names, Li Qiang) is left alone (user, 2026-10-18)
                  (r"(?<![A-Za-z'])li\b", "ri"),
+                 # the distance always with a space before it (user, 2026-10-18): "thousand-ri" -> "thousand ri", "130ri"
+                 # -> "130 ri" (only after a number: a village keeps its hyphen, Kuup-ri; Henri stays Henri)
+                 (r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|twenty|hundred|hundreds|thousand|thousands|million|millions|many|several)-?ri\b", r"\1 ri"),
                  (r"\b(?:Paedojio|Thadoje(?:guk)?(?:ju)?(?:ui)?)(?: Football)? (?:Alliance|Union|League)\b", "Down-with-Imperialism Union")]
 # one romanized Korean syllable (DPRK McCune-Reischauer, with the South's eo/eu too), capitalised
 KO_SYL = r"(?:Kk|Tt|Pp|Ss|Jj|Ch|Kh|Th|Ph|[KNTRMPSJHGDBL])?(?:yae|wae|ae|ya|eo|eu|yo|ye|wa|oe|wo|we|wi|yu|ui|a|o|e|u|i)(?:ng|[ktlmpn])?"
