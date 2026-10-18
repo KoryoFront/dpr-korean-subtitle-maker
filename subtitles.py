@@ -1982,6 +1982,7 @@ VAD_SILENCE_MS, VAD_THRESHOLD = 150, 0.65               # Silero settings for sp
 HANGUL = re.compile(r'[가-힣0-9]')
 END_TRIM_S = 0.1                                        # Silero stops a little late
 WORD_END_SHIFT = float(os.environ.get('WORD_END_SHIFT', '0.05'))   # Whisper word ends, best against Speech-to-Text
+START_SPEECH_GAP = float(os.environ.get('START_SPEECH_GAP', '0.6'))   # see timed_lines
 START_BEFORE_S, START_AFTER_S = 0.8, 2.0                # pause onset search around Gemini's start (tested)
 
 
@@ -2128,10 +2129,16 @@ def timed_lines(lines, x, words=None, korean=None):
                 out[-1][0] = pg
             else:
                 s2 = max(floor, min(guess, et - 0.5))
-        if talk and voiced_seconds(x, s2 - 0.5, s2) > 0.3 and not any(a <= s2 + 0.1 and b > s2 for a, b in talk):
-            # over a music bed the sound rises when the music does: the line was snapped there, 0.4-2 s before anyone
-            # speaks (user, 2026-10-18). Nobody speaking at that start and speech within 2 s: it starts with the speech.
-            later = [a for a, b in talk if s2 + 0.4 <= a <= s2 + 2.0]
+        if talk and not any(a <= s2 + 0.1 and b > s2 for a, b in talk):
+            # nobody speaking at the start: over a music bed the sound rises when the music does, and after a quiet
+            # moment a door, a hit in the music or an effect starts the sound -- the line was snapped there, 0.4-2 s
+            # before anyone speaks (user, 2026-10-18). It starts with the speech: within 0.4-2 s over music; after
+            # quiet only from 0.8 s (the speech detector marks some real starts up to ~0.5 s late)
+            bed = voiced_seconds(x, s2 - 0.5, s2) > 0.3
+            # after quiet, only if Whisper hears no word there either (the speech detector alone missed a real start
+            # by 1.7 s on the benchmark)
+            heard_word = words is None or any(s2 - 0.3 <= w[1] <= s2 + 0.8 for w in words)
+            later = [a for a, b in talk if s2 + (0.4 if bed else START_SPEECH_GAP) <= a <= s2 + 2.0] if bed or not heard_word else []
             if later and later[0] < et - 0.5:
                 s2 = on_speech_start(later[0])
         # end
