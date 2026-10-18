@@ -19,7 +19,7 @@ For `recording.ts` it writes, next to it:
 - Recommended: MKVToolNix (mkvmerge) on the PATH, for the smoothest MKV with interlaced TV pictures: https://mkvtoolnix.download
   (without it, ffmpeg builds the MKV)
 - Optional: demucs (in requirements.txt), which separates the voice from the music so lines marked as song lyrics are checked against the sound: narration over music is shown as speech, lyrics heard over instrumental music or a wordless choir are dropped, and each lyric starts and ends with the singer's phrase instead of Gemini's rough times. Without it Gemini's judgement and times stand. Lyrics are shown as plain subtitles, without music notes.
-- Music videos: when a song's lyrics are written on screen (KCTV music videos show them in the lower half), the subtitles use those exact words, read from the picture by Gemini 3.5 Flash and translated, starting when each caption appears. Songs without on-screen lyrics keep the lyrics heard from the sound.
+- Music videos: when a song's lyrics are written on screen (KCTV music videos show them in the lower half), the subtitles use those exact words, read from the picture by Gemini 3.5 Flash and translated, shown exactly while each caption is on screen (karaoke or static captions alike). Songs without on-screen lyrics keep the lyrics heard from the sound, except over a still picture (a test card), where the music is instrumental.
 - A Gemini API key, either:
   - Google AI Studio, with billing (prepaid credit) enabled: https://aistudio.google.com
   - or a Vertex AI API key (starts `AQ.`) from a Google Cloud project with billing enabled, so Google Cloud credits

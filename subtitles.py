@@ -817,6 +817,9 @@ def time_songs(lines, v):
 
 
 CAPTION_MODEL = 'gemini-3.5-flash'   # reads KCTV's stylised lyric font; Flash-Lite misread it (훨한 for 험한), user 2026-10-18
+CAPTION_MARK = '\u2063'             # (invisible) a line copied from an on-screen caption; rows joined by U+2028
+CAPTION_STILL = 3.0                  # picture motion under this is a still (test card): see dayjob
+CAPTION_MAX_ROW = 22                 # Korean letters: 1,170 of 1,174 lyric rows had 20 or fewer; documentary text 24+
 CAPTION_MIN_S = 2.5                  # verses stay up 5 s+; a shorter caption was a title card (2026-10-17 13:42:23)
 CAPTION_SCHEMA = {"type": "OBJECT", "properties": {"frames": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
     "t": {"type": "NUMBER"}, "text": {"type": "STRING"}}, "required": ["t", "text"]}}}, "required": ["frames"]}
@@ -847,6 +850,18 @@ def read_captions(key, video, t0, t1, fps=2.0, batch=40):
             return None
         out += [(t0 + k / fps, got.get(round(k / fps, 1), '')) for k in range(b0, min(len(jpgs), b0 + batch))]
     return out
+
+
+def picture_motion(video, t0, t1):
+    """How much the picture moves over t0..t1 (mean change between frames 0.5 s apart, small grey frames): the
+    KCTV test card measures 0.1-1.6 (its clock), music videos 11-19. None if it could not be read."""
+    r = subprocess.run(['nice', '-n', '19', 'ffmpeg', '-v', 'quiet', '-ss', '%.3f' % max(0.0, t0), '-i', video, '-t', '%.3f' % (t1 - t0),
+                        '-vf', 'yadif,fps=2,scale=160:90,format=gray', '-f', 'rawvideo', '-'], capture_output=True, timeout=300).stdout
+    n = len(r) // (160 * 90)
+    if n < 3:
+        return None
+    d = np.frombuffer(r[:n * 160 * 90], np.uint8).reshape(n, 90, 160).astype(np.float32)
+    return float(np.abs(np.diff(d, axis=0)).mean())
 
 
 def caption_verses(frames):
@@ -886,36 +901,23 @@ def translate_lyrics(key, rows):
 
 
 def lyrics_from_captions(lines, verses, english, lo, hi):
-    """Replace the lyric lines Gemini heard with the on-screen ones, for verses starting in lo..hi (the lines' clock).
-    english: one line per row of the verses, in order. A verse's first row starts when its caption appears; the later
-    rows where the heard lyric lines start (timed on the singer) when there are as many of them, else by the rows'
-    length; the last row lasts until the caption goes. Heard lyrics in the stretch the captions cover are dropped."""
-    out, k, new = list(lines), 0, []
-    spans = []
+    """Replace the lyric lines Gemini heard with the on-screen captions, for verses starting in lo..hi (the lines'
+    clock). english: one line per row of the verses, in order. Each caption is copied as it is: one subtitle with its
+    rows, up exactly while the caption is (user, 2026-10-18: "just replicate the on-screen text" -- captions are
+    sometimes karaoke, sometimes static). In a piece with lyric captions, a lyric heard only in the sound is dropped:
+    a music video puts every sung line on screen (2026-10-17 13:42:23)."""
+    out, k, new, spans = list(lines), 0, [], []
     for vs, ve, rows in verses:
         en = english[k:k + len(rows)]; k += len(rows)
         if not all(en) or ve < lo or vs >= hi or ve - vs < CAPTION_MIN_S:
             continue                                     # (a caption up for a moment is a title card, not a verse)
-        spans.append((vs - 1.0, ve + 0.5))               # a verse from the piece before still covers its heard lyrics
-        if not (lo <= vs < hi):
-            continue
-        heard = [l for l in lines if l[2].startswith('♪') and vs - 1.0 <= l[0] < ve - 0.5]
-        if len(rows) > 1 and len(heard) == len(rows):
-            starts = [vs] + [max(vs + 0.8 * n, l[0]) for n, l in enumerate(heard[1:], 1)]
-        else:
-            tot = sum(len(r) for r in rows) or 1
-            starts, done = [], 0
-            for r in rows:
-                starts.append(vs + (ve - vs) * done / tot); done += len(r)
-        for n, (a, e) in enumerate(zip(starts, en)):
-            b = starts[n + 1] - 0.08 if n + 1 < len(starts) else ve
-            # the whole row: a lyric line sung over 14 s is split into its subtitles across all of it (capped at 7 s
-            # it was squeezed into the first half, user 2026-10-18 at 0:47:11); each subtitle still at most 7 s
-            new.append((a, max(a + 0.8, b), '♪ ' + e))
+        if max(len(HANGUL.findall(r)) for r in rows) > CAPTION_MAX_ROW:
+            continue                                     # a sentence of on-screen text (a documentary), not a lyric
+        spans.append((vs - 1.0, ve + 0.5))
+        if lo <= vs < hi:
+            new.append((vs, ve, '♪ ' + CAPTION_MARK + '\u2028'.join(e.strip() for e in en)))
     if not spans:
         return lines
-    # a music video puts every sung line on screen: in a piece with lyric captions, a lyric heard only in the sound
-    # (no caption then) was not sung (2026-10-17 13:42:23: "Living with the motherland" over a wordless choir)
     kept = [l for l in out if not l[2].startswith('♪')]
     return sorted(kept + new)
 
@@ -1470,7 +1472,7 @@ def split_cues(text):
     return out
 
 
-LINGER_S = 0.4                                      # a subtitle stays at most this long after its words end
+LINGER_S = 0.2                                      # a subtitle stays at most this long after its words end
 LATE_S = 0.1                                  # most a subtitle may start after its voice (see polish)
 SPEECH_GAP_S = 1.5                                      # see speech_gaps
 SING_SHARE = 0.45                                       # see singing()
@@ -1480,7 +1482,7 @@ VOICE_TALK_MIN = 0.3                                    # see voice_kind
 SONG_VOICE_MIN = 0.1                                    # see voice_kind
 SUNG_MAX_SPEECH = 0.5                                   # see spoken_not_sung
 NAME_SAFE_SPLIT = True                                  # see split_two
-READ_CPS, READ_MIN_S = 17.0, 1.2                       # reading speed and the shortest subtitle
+READ_CPS, READ_MIN_S = 20.0, 1.0                       # reading speed and the shortest subtitle
 LEAD_S = 0.0                                  # a subtitle never shows before its voice (user: 'start early')
 
 
@@ -1493,6 +1495,24 @@ def make_cues(lines, onsets=None, open_end=False):
     for st, et, en in tidy_lines(lines):
         song = en.startswith('♪')
         en = en.lstrip('♪ ').strip()
+        if CAPTION_MARK in en:                               # an on-screen caption: one subtitle, its rows as they are
+            rs = [r.strip() for r in en.replace(CAPTION_MARK, '').split('\u2028') if r.strip()]
+            if len(rs) <= 2 and all(len(r) <= LINE for r in rs):
+                cues.append([st, et, en, True, et, True]); continue
+            # too long for two lines as on screen: the same words in two balanced lines, or two subtitles sharing the
+            # caption's time by length
+            joined = ' '.join(rs)
+            if split_two(joined):
+                cues.append([st, et, CAPTION_MARK + '\u2028'.join(split_two(joined)), True, et, True]); continue
+            halves = split_cues(joined)
+            if len(halves) < 2:
+                w = joined.split(); halves = [' '.join(w[:len(w) // 2]), ' '.join(w[len(w) // 2:])]
+            tot, t0 = sum(len(h) for h in halves) or 1, st
+            for h in halves:
+                t1 = t0 + (et - st) * len(h) / tot
+                cues.append([t0, t1 - (0.08 if t1 < et else 0), CAPTION_MARK + '\u2028'.join(split_two(h) or [h]), True, t1, True])
+                t0 = t1
+            continue
         # capital only at the start of the sentence; a continuation keeps its lower case
         # a sentence split over several subtitles: the middle parts keep a natural comma, no dash or semicolon
         parts = [re.sub(r'[\s;:\-–—]+$', '', p).strip() for p in split_cues(clean_text(en) if not song else clean_text(en).rstrip('.'))]
@@ -1531,8 +1551,13 @@ def make_cues(lines, onsets=None, open_end=False):
     cues.sort(key=lambda c: c[0])
     for i, c in enumerate(cues):
         nxt = cues[i + 1][0] if i + 1 < len(cues) else c[0] + 7.0
-        want = max(1.0, len(c[2]) / 17.0)
+        want = max(1.0, len(c[2]) / READ_CPS)
         c[1] = max(c[1], min(c[0] + want, nxt - 0.08))                     # long enough to read, if there is room
+        if CAPTION_MARK in c[2]:
+            # copied from the screen: up while the caption is up (user, 2026-10-18: "just replicate the on-screen
+            # text"), only cut where the next subtitle begins
+            c[1] = min(c[1], nxt - 0.08) if i + 1 < len(cues) else c[1]
+            continue
         if c[3] and SONG_RAW:
             # lyrics keep Gemini's times exactly (user, 2026-10-18: "music is sometimes slow"): only cut short where
             # the next subtitle begins
@@ -1576,7 +1601,14 @@ def make_cues(lines, onsets=None, open_end=False):
         if room >= 0.5:
             c[1] = c[0] + min(room, max(0.83, len(c[2]) / READ_CPS)); safe.append(c)
     cues = safe
-    return [(c[0], c[1], song_marks(split_two(c[2]) or [c[2]]) if c[3] else '\n'.join(split_two(c[2]) or [c[2]])) for c in cues]
+    def rows(c):
+        if CAPTION_MARK in c[2]:
+            rs = [r.strip() for r in c[2].replace(CAPTION_MARK, '').split('\u2028') if r.strip()]
+            if len(rs) == 1 and len(rs[0]) > LINE:          # one long row: two lines, as any subtitle
+                rs = split_two(rs[0]) or rs
+            return song_marks(rs)
+        return song_marks(split_two(c[2]) or [c[2]]) if c[3] else '\n'.join(split_two(c[2]) or [c[2]])
+    return [(c[0], c[1], rows(c)) for c in cues]
 
 
 def polish(cues):
@@ -1604,7 +1636,7 @@ def polish(cues):
     # too much to read (over 20 characters a second): a small lead-in from free time before (at most 0.3 s, as on
     # broadcast TV), then time the next subtitle can spare (it starts a little later but keeps enough for its own text)
     for i, c in enumerate(out):
-        need = len(c[2]) / 17.0 - (c[1] - c[0])
+        need = len(c[2]) / READ_CPS - (c[1] - c[0])
         if need <= 0 or len(c[2]) / max(0.1, c[1] - c[0]) <= 20 or fixed(c):
             continue
         free_before = c[0] - (out[i - 1][1] + 0.08 if i else 0)
@@ -1612,7 +1644,7 @@ def polish(cues):
         c[0] -= lead; need -= lead
         if need > 0 and i + 1 < len(out):
             n = out[i + 1]
-            spare = 0.0 if fixed(n) else (n[1] - n[0]) - max(0.83, len(n[2]) / 17.0)
+            spare = 0.0 if fixed(n) else (n[1] - n[0]) - max(0.83, len(n[2]) / READ_CPS)
             take = max(0.0, min(need, spare, late(n)))
             if take > 0:
                 n[0] += take

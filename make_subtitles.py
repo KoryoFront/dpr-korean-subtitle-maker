@@ -656,6 +656,11 @@ def main():
                                 os.replace(fc + '.tmp', fc)
                     if cap and cap['verses']:
                         out = LIVE.lyrics_from_captions(out, [tuple(v) for v in cap['verses']], cap['english'], 0.0, float(c1 - c0))
+                    elif cap is not None:
+                        # no lyrics on screen over a still picture (a test card): instrumental music, invented lyrics
+                        m = LIVE.picture_motion(cut, c0 + a_off, c1 + a_off)
+                        if m is not None and m < LIVE.CAPTION_STILL:
+                            out = [l for l in out if not l[2].startswith('♪')]
                 out = LIVE.snap_to_speech(out, xc, None, g.korean)
             if LIVE:
                 with lock:
