@@ -338,6 +338,11 @@ KO_SYL = r"(?:Kk|Tt|Pp|Ss|Jj|Ch|Kh|Th|Ph|[KNTRMPSJHGDBL])?(?:yae|wae|ae|ya|eo|eu
 
 def dprk_english(t):
     """Safety net for the house style: the DPRK never calls itself 'North Korea'."""
+    # invisible control characters never reach a subtitle: a NUL in "26\\x00degC" (meant 26°C) made the muxer stop
+    # reading the SRT there and 166 subtitles were missing from the MKV (2026-10-17 day file, 13:34:53)
+    t = re.sub(r'\x00\s*deg\s*([CF])\b', r'°\1', t)
+    t = re.sub(r'\s?\bdeg(?:rees?)?C\b', '°C', t)
+    t = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', t)
     t = re.sub(r"\bNorth Korean\b", "Korean", t)
     t = t.replace('℃', '°C').replace('℉', '°F')
     t = re.sub(r"\b[Tt]he North Korea\b|\bNorth Korea\b", "the DPRK", t)
@@ -1349,6 +1354,7 @@ LEADERS = re.compile(r"\bKim(\s+)(Il(\s+)Sung|Jong(\s+)Il|Jong(\s+)Un|Jong(\s+)S
 def bold_leaders(t):
     """The leaders' names in bold (user's request): Kim Il Sung, Kim Jong Il, Kim Jong Un, Kim Jong Suk. A name split
     over the two lines of a subtitle is bolded on each line."""
+    t = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', t)            # every writer passes here: no control characters
     return LEADERS.sub(lambda m: '\n'.join('<b>%s</b>' % part for part in m.group(0).split('\n')), t)
 
 
@@ -1552,6 +1558,22 @@ def make_cues(lines, onsets=None, open_end=False):
             c[1] = min(c[1], max(c[4] + LINGER_S, c[0] + READ_MIN_S))
         c[1] = max(c[1], c[0] + 0.83)                                       # broadcast minimum: 5/6 of a second
     cues = polish(cues)
+    # last safety net: never a subtitle that ends before it starts or flashes for a moment (2026-10-17 day file
+    # 2:17:33 had three ending before they began): joined to the next one if they fit together, else lengthened
+    # into the free time after it, else dropped
+    safe = []
+    for i, c in enumerate(cues):
+        if c[1] - c[0] >= 0.3:
+            safe.append(c); continue
+        n = cues[i + 1] if i + 1 < len(cues) else None
+        joined = c[2] + ' ' + n[2] if n is not None else None
+        if n is not None and n[3] == c[3] and split_two(joined) and len(joined) <= 2 * LINE and n[1] - c[0] <= 7.0:
+            n[0], n[2] = c[0], joined
+            continue
+        room = (n[0] - 0.08 if n is not None else c[0] + 0.83) - c[0]
+        if room >= 0.5:
+            c[1] = c[0] + min(room, max(0.83, len(c[2]) / READ_CPS)); safe.append(c)
+    cues = safe
     return [(c[0], c[1], song_marks(split_two(c[2]) or [c[2]]) if c[3] else '\n'.join(split_two(c[2]) or [c[2]])) for c in cues]
 
 
@@ -1632,8 +1654,8 @@ def polish(cues):
 
 SONG_SNAP_S = 1.5          # see time_songs
 SONG_RAW = True            # user, 2026-10-18: lyrics on Gemini's own start and end, nothing snapped or stretched
-SONG_MARKS = False          # user, 2026-10-18: no music notes, lyrics shown like any other line (telling singing
-                            # from speech over music was never reliable); songs are still timed as songs inside
+SONG_MARKS = True           # user, 2026-10-18: music notes back (♪ ... ♪) now that lyrics are checked against the
+                            # separated voice and taken from the on-screen captions; earlier the same day they were off
 
 
 def song_marks(rows):
@@ -2035,11 +2057,11 @@ def timed_lines(lines, x, words=None, korean=None):
     snapped = {l[2]: l for l in snap_to_speech_plain(lines, x)}
     sing = singing(x) if not SONG_RAW and any(l[2].startswith('♪') for l in lines) else None
     talk = None
-    out = []
+    out, guesses = [], []
     for i, (st, et, en) in enumerate(lines):
         if en.startswith('♪'):
             if SONG_RAW:                                 # Gemini's own times (user, 2026-10-18)
-                out.append((st, et, en)); continue
+                out.append([st, et, en]); guesses.append(st); continue
             # a lyric stays up while the singer still sings (held notes), up to the next line and 7 s
             if sing is not None:
                 nxt = min([l[0] for l in lines if l[0] > st + 0.3] or [len(x) / 16000])
@@ -2049,7 +2071,7 @@ def timed_lines(lines, x, words=None, korean=None):
                     quiet = 0 if sing[k] else quiet + 1
                     k += 1
                 et = max(et, (k - quiet) / 100)
-            out.append((st, et, en)); continue
+            out.append([st, et, en]); guesses.append(st); continue
         if et - st >= 2.0 and _vad is not None:
             # a spoken line of 2 s+ with (almost) no speech under it was invented over music (2026-10-17: "Guided by
             # the WPK" over an instrumental); short quiet drama lines are kept (3 of 255 real lines score that low)
@@ -2100,6 +2122,15 @@ def timed_lines(lines, x, words=None, korean=None):
                     q = qon_t[(qon_t >= ss[0] - 0.3) & (qon_t <= ss[0] + 0.05)] if len(qon_t) else qon_t
                     c = np.array([float(q[-1]) if len(q) else ss[0] - 0.05])   # Silero starts a little late
         s2 = float(c[np.argmin(np.abs(c - guess))]) if len(c) else snapped.get(en, (st,))[0]
+        if out and not len(c) and s2 <= out[-1][0]:
+            # the plain snap knows no order: two lines on one onset, or this one before the line before (2026-10-17
+            # 2:17:33: a 12 s line snapped ahead of the line before and was then cut to nothing). The onset goes to
+            # the line Gemini put nearer it; the other keeps Gemini's own start.
+            pg = guesses[-1]
+            if abs(s2 - guess) < abs(out[-1][0] - pg) and pg < s2 - 0.5 and (len(out) < 2 or pg > out[-2][0] + 0.6):
+                out[-1][0] = pg
+            else:
+                s2 = max(floor, min(guess, et - 0.5))
         if INSPEECH_KEEP and talk is None and _vad is not None:
             try:
                 talk = _vad(np.asarray(x, dtype=np.float32), _VadOptions(min_silence_duration_ms=150, speech_pad_ms=0, threshold=0.5))
@@ -2141,7 +2172,7 @@ def timed_lines(lines, x, words=None, korean=None):
                     c = offs[(offs > s2 + 0.3) & (offs <= et + 1.0) & (np.abs(offs - est) <= 1.5)]
                     et = est
             e2 = (float(c[np.argmin(np.abs(c - et))]) if len(c) else et) - END_TRIM_S
-        out.append([s2, max(e2, s2 + 0.5), en])
+        out.append([s2, max(e2, s2 + 0.5), en]); guesses.append(guess)
     out.sort(key=lambda l: l[0])
     for i in range(len(out) - 1):                         # a line never runs on past the start of the next
         if not out[i][2].startswith('♪') and out[i][1] > out[i + 1][0] - 0.05:
@@ -2284,7 +2315,12 @@ def tidy_lines(lines):
     kept = []
     for a, b, t in sorted(lines, key=lambda x: (x[0], x[1])):
         song = t.startswith('♪')
-        if kept and a - kept[-1][1] < (0.0 if song else 8) and repeats(t.lstrip('♪ '), [kept[-1][2].lstrip('♪ ')], 0.85) and len(content_words(t)) >= 2:
+        # a copy of the same words (the same sound transcribed twice, at a batch edge) overlaps the line before; a
+        # similar line after it is real speech (2026-10-17: the weather for the next city, a narrator restating a
+        # point -- dropped within 8 s, they left 5-15 s of speech without subtitles)
+        if kept and a - kept[-1][1] < (0.0 if song else 1.0) and repeats(t.lstrip('♪ '), [kept[-1][2].lstrip('♪ ')], 0.85) and len(content_words(t)) >= 2:
+            if not song and b > kept[-1][1]:       # the copy's speech still needs a subtitle: the kept line spreads
+                kept[-1] = (kept[-1][0], b, kept[-1][2])   # over it (2026-10-17 5:43: 8 s left empty)
             continue                                 # a song's refrain is sung again and shown again (2026-10-16 13:45)
         kept.append((a, b, t))
     lines = kept
