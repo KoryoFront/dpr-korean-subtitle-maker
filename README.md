@@ -14,7 +14,7 @@ For `recording.ts` it writes, next to it:
 
 ## Requirements
 
-- Python 3.8 or newer, with numpy and faster-whisper (its Silero speech detector decides where each subtitle ends): `pip install -r requirements.txt`
+- Python 3.8 or newer, with numpy and faster-whisper: `pip install -r requirements.txt`. Its Silero speech detector finds where speech starts, and Whisper (the "small" model, downloaded once, runs on your computer) hears where each line's last word ends.
 - ffmpeg and ffprobe on the PATH: https://ffmpeg.org/download.html
 - Recommended: MKVToolNix (mkvmerge) on the PATH, for the smoothest MKV with interlaced TV pictures: https://mkvtoolnix.download
   (without it, ffmpeg builds the MKV)

@@ -661,7 +661,13 @@ def main():
                         m = LIVE.picture_motion(cut, c0 + a_off, c1 + a_off)
                         if m is not None and m < LIVE.CAPTION_STILL:
                             out = [l for l in out if not l[2].startswith('♪')]
-                out = LIVE.snap_to_speech(out, xc, None, g.korean)
+                fw = W + 'chunks/%05d.whisper.json' % ci       # Whisper's word times (free, on this computer): line ends
+                words = json.load(open(fw, encoding='utf-8')) if os.path.exists(fw) else LIVE.whisper_words(xc) if out else None
+                if words is not None and not os.path.exists(fw):
+                    with open(fw + '.tmp', 'w', encoding='utf-8') as fh:
+                        json.dump(words, fh, ensure_ascii=False)
+                    os.replace(fw + '.tmp', fw)
+                out = LIVE.snap_to_speech(out, xc, [tuple(w) for w in words] if words else None, g.korean)
             if LIVE:
                 with lock:
                     starts.append(c0 + LIVE.voice_starts(xc))   # where the voice resumes: long lines break there
